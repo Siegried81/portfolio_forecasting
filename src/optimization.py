@@ -1,0 +1,154 @@
+"""
+Mean-variance portfolio optimization via PyPortfolioOpt (chosen over Riskfolio-Lib:
+lighter footprint, actively maintained, and covers exactly what the brief needs —
+max-Sharpe / min-vol optimal weights + an efficient frontier — without the extra
+install weight of Riskfolio-Lib's convex-optimization stack).
+
+This module is deliberately agnostic to WHERE mu (expected returns) and the
+covariance matrix come from — the same `optimize_max_sharpe` / `efficient_frontier_points`
+functions are used for all three portfolios the brief asks for:
+  1. Historical-based  : mu/cov estimated from realised historical returns
+  2. Forecast-based    : mu from the forecasting module, cov still historical
+                          (covariance forecasting is a research problem in itself;
+                          using the historical covariance is standard practice
+                          even in forecast-driven allocation)
+  3. Realized-optimal  : mu/cov estimated from the ACTUAL future returns (hindsight
+                          optimum) — the benchmark the other two are judged against
+"""
+from __future__ import annotations
+
+import numpy as np
+import pandas as pd
+from pypfopt import EfficientFrontier, expected_returns, risk_models
+from pypfopt.exceptions import OptimizationError
+
+from src.config import DEFAULT_RISK_FREE_RATE, TRADING_DAYS_PER_YEAR
+
+
+def historical_mu_cov(prices: pd.DataFrame, periods_per_year: int = TRADING_DAYS_PER_YEAR) -> tuple[pd.Series, pd.DataFrame]:
+    """
+    Annualised mean historical return (mu) and covariance (Ledoit-Wolf shrinkage)
+    from a price history. Shrinkage covariance is used instead of the raw sample
+    covariance because with few assets and a short history the sample covariance
+    is noisy and can produce unstable, extreme optimal weights — shrinkage is the
+    standard practitioner fix (per Ledoit & Wolf, 2004).
+
+    `periods_per_year` MUST match the actual periodicity of `prices` (252 for
+    daily, 52 for weekly, 12 for monthly — see config.FREQUENCY_TO_PERIODS_PER_YEAR).
+    Passing the wrong value here doesn't error — PyPortfolioOpt just silently
+    annualises as if every row were one trading day, which massively overstates
+    "expected return" on weekly/monthly data (a ~5-year weekly series has ~260
+    rows; annualising with frequency=252 treats that as barely one year of daily
+    data, compounding the horizon by roughly 5x). Always pass the caller's actual
+    `periods_per_year`, never rely on the default.
+    """
+    mu = expected_returns.mean_historical_return(prices, frequency=periods_per_year)
+    cov = risk_models.CovarianceShrinkage(prices, frequency=periods_per_year).ledoit_wolf()
+    return mu, cov
+
+
+def forecast_mu(
+    current_prices: pd.Series,
+    forecasted_prices: pd.DataFrame,
+    horizon_periods: int,
+    periods_per_year: int = TRADING_DAYS_PER_YEAR,
+) -> pd.Series:
+    """
+    Convert forecasted end-of-horizon prices into an ANNUALISED expected return,
+    so it's on the same scale as `historical_mu_cov`'s mu and can be swapped into
+    the same optimizer unchanged.
+
+    `horizon_periods` is a count of periods AT THE SELECTED FREQUENCY (e.g. 30
+    weekly steps if the sidebar frequency is "weekly", not 30 calendar days) —
+    same `periods_per_year` mismatch risk as `historical_mu_cov` above applies here.
+    """
+    last_forecast = forecasted_prices.iloc[-1]
+    horizon_return = last_forecast / current_prices[forecasted_prices.columns] - 1.0
+    years = horizon_periods / periods_per_year
+    # Compound the horizon return out to an annual rate; guard against negative
+    # base (a forecast crashing below zero) which would make the exponent undefined.
+    annualised = (1.0 + horizon_return).clip(lower=1e-6) ** (1.0 / years) - 1.0
+    return annualised
+
+
+def optimize_max_sharpe(
+    mu: pd.Series,
+    cov: pd.DataFrame,
+    risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+    weight_bounds: tuple[float, float] = (0.0, 1.0),
+) -> pd.Series:
+    """Weights maximising the Sharpe ratio (long-only by default — weight_bounds
+    can be opened to allow shorting if the UI ever exposes that).
+
+    Guards against an infeasible upper bound: with N assets, weights summing to
+    1.0 is impossible if the cap is below 1/N (e.g. a 35% max-weight constraint
+    with only 2 assets selected — no valid allocation can sum to 100%). Relaxes
+    the cap to 1/N in that case rather than letting PyPortfolioOpt raise.
+    """
+    lower, upper = weight_bounds
+    n_assets = len(mu)
+    if n_assets > 0 and upper < 1.0 / n_assets:
+        upper = 1.0 / n_assets
+        weight_bounds = (lower, upper)
+
+    ef = EfficientFrontier(mu, cov, weight_bounds=weight_bounds)
+    try:
+        ef.max_sharpe(risk_free_rate=risk_free_rate)
+    except (OptimizationError, ValueError):
+        # Degenerate case — e.g. every asset's expected return is below the
+        # risk-free rate (a bear-market date range, or a bad forecast going
+        # negative). PyPortfolioOpt raises a plain ValueError here, not its own
+        # OptimizationError, so both must be caught. Fall back to min-volatility,
+        # which is always solvable, rather than crashing the whole app.
+        ef = EfficientFrontier(mu, cov, weight_bounds=weight_bounds)
+        ef.min_volatility()
+    weights = ef.clean_weights()
+    return pd.Series(weights)
+
+
+def efficient_frontier_points(
+    mu: pd.Series,
+    cov: pd.DataFrame,
+    n_points: int = 25,
+    weight_bounds: tuple[float, float] = (0.0, 1.0),
+) -> pd.DataFrame:
+    """
+    Sample the efficient frontier by sweeping target returns between the
+    min-volatility portfolio's return and the max achievable return, solving a
+    min-volatility QP at each target. Returns a tidy DataFrame ready for plotting:
+    columns = ["volatility", "return"].
+    """
+    ef_minvol = EfficientFrontier(mu, cov, weight_bounds=weight_bounds)
+    ef_minvol.min_volatility()
+    min_vol_return = ef_minvol.portfolio_performance()[0]
+
+    max_return = mu.max()
+    target_returns = np.linspace(min_vol_return, max_return * 0.999, n_points)
+
+    points = []
+    for target in target_returns:
+        try:
+            ef = EfficientFrontier(mu, cov, weight_bounds=weight_bounds)
+            ef.efficient_return(target_return=target)
+            ret, vol, _ = ef.portfolio_performance()
+            points.append({"return": ret, "volatility": vol})
+        except (OptimizationError, ValueError):
+            continue  # infeasible target on this grid point — skip, keep the rest
+
+    return pd.DataFrame(points)
+
+
+def portfolio_performance(
+    mu: pd.Series,
+    cov: pd.DataFrame,
+    weights: pd.Series,
+    risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+) -> dict[str, float]:
+    """Expected annual return / volatility / Sharpe for a given weight vector,
+    using the SAME mu/cov the weights were optimised on (so this reports the
+    optimizer's own expectation, distinct from realised performance metrics.py computes)."""
+    w = weights.reindex(mu.index).fillna(0.0).values
+    ret = float(np.dot(w, mu))
+    vol = float(np.sqrt(np.dot(w, np.dot(cov, w))))
+    sharpe = (ret - risk_free_rate) / vol if vol > 0 else float("nan")
+    return {"expected_return": ret, "expected_volatility": vol, "expected_sharpe": sharpe}

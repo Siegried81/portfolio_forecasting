@@ -1,0 +1,36 @@
+# --- Core app ---
+# Minimum versions below (not exact pins): exact pins go stale fast as new Python
+# releases ship (this project hit that directly — pandas==2.2.2 predates Python 3.14
+# wheels entirely, forcing a slow from-source build that broke on newer GCC/Cython).
+# Minimums here are the first version of each package confirmed to support Python
+# 3.14 cleanly; pip will resolve to the latest compatible release above that floor.
+streamlit>=1.50.0
+pandas>=3.0.5      # 3.0.0-3.0.4 have a confirmed Python 3.14 segfault regression - need 3.0.5+
+numpy>=2.2
+python-dotenv>=1.0.1
+
+# --- Market data (free) ---
+yfinance>=0.2.43
+
+# --- Finance / optimization ---
+PyPortfolioOpt>=1.6.0
+scipy>=1.14         # first release with Python 3.13 wheels; 3.14 wheels followed
+
+# --- Forecasting ---
+# Upper bound is deliberate, not just a floor: statsmodels 0.15.0 has an internal
+# regression (a `deprecate_kwarg` signature mismatch in statsmodels.tsa.arima's
+# yule_walker estimator module) that breaks `from statsmodels.tsa.arima.model
+# import ARIMA` entirely - confirmed by testing. 0.14.6 has full Python 3.12-3.14 /
+# pandas 3.0 / numpy 2.x support without this bug.
+statsmodels>=0.14.4,<0.15.0
+
+# --- Visualisation ---
+plotly>=5.24.1
+
+# --- LLM (Groq primary, Ollama fallback via plain HTTP so no extra SDK needed for Ollama) ---
+groq>=1.0.0   # groq<1.0 breaks with httpx>=0.28 (removed the "proxies" kwarg groq<1.0 still passes)
+requests>=2.32.3
+tiktoken>=0.8.0  # token counting, used to keep news context within LLM limits
+
+# --- Tests ---
+pytest>=8.3.3
