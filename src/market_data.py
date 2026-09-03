@@ -56,6 +56,12 @@ class MarketDataError(RuntimeError):
     """Raised when price data cannot be retrieved from ANY source."""
 
 
+class TwelveDataPlanRestricted(RuntimeError):
+    """Raised when Twelve Data returns a 403 indicating an endpoint (typically
+    /statistics for non-demo tickers) requires a paid plan — distinct from a
+    transient failure, so callers can surface the real reason to the user."""
+
+
 def _download_yfinance(tickers: list[str], start: dt.date, end: dt.date) -> pd.DataFrame:
     """
     One yfinance attempt with retry-with-backoff for transient failures (mainly
@@ -357,7 +363,17 @@ def fetch_fundamentals(ticker: str) -> dict | None:
         return None
 
     if payload.get("status") == "error" or "code" in payload and "message" in payload:
-        logger.warning("Twelve Data fundamentals unavailable for %s: %s", ticker, payload.get("message", payload))
+        message = payload.get("message", str(payload))
+        if payload.get("code") == 403:
+            # Confirmed via live testing (2026-09-03): Twelve Data's free tier only
+            # grants /statistics access on their public demo symbol (AAPL) — every
+            # other ticker returns this 403, regardless of retry or pacing. This is
+            # a plan restriction, not a transient failure, so it's raised distinctly
+            # rather than folded into the generic "return None" path — the caller
+            # should tell the user WHY, not just show a blank dash that looks like
+            # a bug.
+            raise TwelveDataPlanRestricted(message)
+        logger.warning("Twelve Data fundamentals unavailable for %s: %s", ticker, message)
         return None
 
     stats = payload.get("statistics", {})

@@ -21,8 +21,8 @@ from __future__ import annotations
 import pandas as pd
 
 from src.forecasting import forecast_all_assets
-from src.metrics import compute_returns, portfolio_returns, summarise_performance
-from src.optimization import forecast_mu, historical_mu_cov, optimize_max_sharpe
+from src.metrics import apply_transaction_cost, compute_returns, compute_turnover, portfolio_returns, summarise_performance
+from src.optimization import forecast_mu, historical_mu_cov, optimize_max_sharpe, resolve_weight_bounds
 
 
 def generate_expanding_windows(
@@ -54,6 +54,8 @@ def run_walk_forward(
     periods_per_year: int,
     min_train_periods: int,
     max_weight_per_asset: float = 1.0,
+    allow_short_selling: bool = False,
+    transaction_cost_bps: float = 0.0,
 ) -> pd.DataFrame:
     """
     Run the historical / forecast / realized-optimal comparison across several
@@ -62,16 +64,24 @@ def run_walk_forward(
 
     Columns: window, window_end (date), portfolio, annual_return,
     annual_volatility, sharpe_ratio, sortino_ratio, max_drawdown, var_95, cvar_95.
+
+    Transaction costs: `transaction_cost_bps` charges turnover × rate at EVERY
+    window boundary for every portfolio type, tracked independently (each
+    portfolio type rebalances against its OWN previous window's weights, not a
+    shared reference) — this is also where "rebalancing frequency" shows up in
+    practice: a shorter `horizon` means more windows over the same history, i.e.
+    more frequent rebalancing, i.e. more cumulative cost drag realised here.
     """
     windows = generate_expanding_windows(len(prices), horizon, min_train_periods, n_windows)
     records: list[dict] = []
+    previous_weights: dict[str, pd.Series] = {}
 
     for window_idx, (train_end, test_end) in enumerate(windows, start=1):
         train_prices = prices.iloc[:train_end]
         test_prices = prices.iloc[train_end:test_end]
         test_returns = compute_returns(test_prices[tickers])
 
-        weight_bounds = (0.0, max_weight_per_asset)
+        weight_bounds = resolve_weight_bounds(max_weight_per_asset, allow_short_selling)
 
         # 1. Historical-based — fit on this window's training slice only
         mu_hist, cov_hist = historical_mu_cov(train_prices[tickers], periods_per_year)
@@ -87,7 +97,12 @@ def run_walk_forward(
         w_real = optimize_max_sharpe(mu_real, cov_real, risk_free_rate, weight_bounds)
 
         for label, weights in [("Historical-based", w_hist), ("Forecast-based", w_fcst), ("Realized-optimal", w_real)]:
-            perf = summarise_performance(portfolio_returns(test_returns, weights), risk_free_rate, periods_per_year)
+            port_returns = portfolio_returns(test_returns, weights)
+            if transaction_cost_bps > 0:
+                turnover = compute_turnover(weights, previous_weights.get(label))
+                port_returns = apply_transaction_cost(port_returns, turnover, transaction_cost_bps)
+            previous_weights[label] = weights
+            perf = summarise_performance(port_returns, risk_free_rate, periods_per_year)
             records.append({"window": window_idx, "window_end": test_prices.index[-1], "portfolio": label, **perf})
 
     return pd.DataFrame(records)

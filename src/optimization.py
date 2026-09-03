@@ -71,6 +71,18 @@ def forecast_mu(
     return annualised
 
 
+def resolve_weight_bounds(max_weight_per_asset: float, allow_short_selling: bool) -> tuple[float, float]:
+    """
+    Turn the two sidebar controls (max weight, short-selling toggle) into the
+    `weight_bounds` tuple every optimizer call needs. Long-only by default
+    (0, cap); enabling short-selling makes it symmetric (-cap, cap) — the
+    portfolio still stays fully invested (weights sum to 1), this only lets
+    individual positions go negative, it does not add gross leverage.
+    """
+    lower = -max_weight_per_asset if allow_short_selling else 0.0
+    return (lower, max_weight_per_asset)
+
+
 def optimize_max_sharpe(
     mu: pd.Series,
     cov: pd.DataFrame,
@@ -84,12 +96,32 @@ def optimize_max_sharpe(
     1.0 is impossible if the cap is below 1/N (e.g. a 35% max-weight constraint
     with only 2 assets selected — no valid allocation can sum to 100%). Relaxes
     the cap to 1/N in that case rather than letting PyPortfolioOpt raise.
+
+    Note this doesn't fully solve short-selling's own feasibility limits: with a
+    small universe and a tight per-asset cap, there may not be enough long
+    exposure available elsewhere to "fund" a meaningful short (e.g. 3 assets
+    capped at 35% each can push a losing asset down to at most +30%, never
+    negative — two other assets maxed at 35% only sum to 70%, forcing the third
+    to make up the remaining 30%). That outcome is mathematically correct given
+    the constraints, not a bug — more assets or a higher cap creates the room a
+    short position needs.
     """
     lower, upper = weight_bounds
     n_assets = len(mu)
     if n_assets > 0 and upper < 1.0 / n_assets:
         upper = 1.0 / n_assets
         weight_bounds = (lower, upper)
+
+    if lower < 0:
+        # max_sharpe()'s internal convex reformulation (the Cornuejols-Tütüncü
+        # auxiliary-variable trick) is documented to raise a spurious "infeasible"
+        # OptimizationError once the lower bound goes negative — confirmed
+        # directly against this exact mu/cov/bounds combination, and matches a
+        # long-standing open PyPortfolioOpt issue (github.com/robertmartin8/
+        # PyPortfolioOpt/issues/436). max_quadratic_utility() uses a different,
+        # unaffected formulation, so a small scan over risk_aversion values finds
+        # the best-Sharpe point on the frontier instead.
+        return _max_sharpe_via_utility_scan(mu, cov, risk_free_rate, weight_bounds)
 
     ef = EfficientFrontier(mu, cov, weight_bounds=weight_bounds)
     try:
@@ -104,6 +136,35 @@ def optimize_max_sharpe(
         ef.min_volatility()
     weights = ef.clean_weights()
     return pd.Series(weights)
+
+
+_UTILITY_SCAN_RISK_AVERSIONS = [0.01, 0.05, 0.1, 0.3, 0.5, 1, 2, 5, 10, 20, 50]
+
+
+def _max_sharpe_via_utility_scan(
+    mu: pd.Series, cov: pd.DataFrame, risk_free_rate: float, weight_bounds: tuple[float, float],
+) -> pd.Series:
+    """Approximate max-Sharpe by scanning `max_quadratic_utility`'s risk_aversion
+    parameter and keeping whichever point achieves the best REALIZED Sharpe —
+    a standard, documented workaround for cases where `max_sharpe()` itself is
+    unreliable (see the caller's docstring). Falls back to min-volatility (always
+    solvable, including with negative bounds) if every scan point fails."""
+    best_sharpe, best_weights = -np.inf, None
+    for risk_aversion in _UTILITY_SCAN_RISK_AVERSIONS:
+        try:
+            ef = EfficientFrontier(mu, cov, weight_bounds=weight_bounds)
+            ef.max_quadratic_utility(risk_aversion=risk_aversion)
+            _, _, sharpe = ef.portfolio_performance(risk_free_rate=risk_free_rate)
+        except (OptimizationError, ValueError):
+            continue
+        if sharpe > best_sharpe:
+            best_sharpe, best_weights = sharpe, ef.clean_weights()
+
+    if best_weights is None:
+        ef = EfficientFrontier(mu, cov, weight_bounds=weight_bounds)
+        ef.min_volatility()
+        best_weights = ef.clean_weights()
+    return pd.Series(best_weights)
 
 
 def efficient_frontier_points(

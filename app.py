@@ -16,6 +16,7 @@ UI stays skimmable.
 from __future__ import annotations
 
 import datetime as dt
+import os
 import time
 
 import numpy as np
@@ -24,6 +25,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.ai_features import answer_portfolio_question, build_results_context, generate_commentary, generate_news_digest
+from src.rag import build_chunks
 from src.backtesting import forecast_win_rate, generate_expanding_windows, run_walk_forward
 from src.config import (
     ALL_KNOWN_TICKERS,
@@ -32,6 +34,7 @@ from src.config import (
     DEFAULT_FORECAST_HORIZON_DAYS,
     DEFAULT_MAX_WEIGHT_PER_ASSET,
     DEFAULT_RISK_FREE_RATE,
+    DEFAULT_TRANSACTION_COST_BPS,
     DEFAULT_WALK_FORWARD_WINDOWS,
     FREQUENCY_TO_PERIODS_PER_YEAR,
     LLM_SETTINGS,
@@ -45,9 +48,23 @@ from src.config import (
 from src.forecasting import FORECAST_MODELS, forecast_all_assets
 from src.llm_client import LLMUnavailableError
 from src.macro_data import fetch_current_risk_free_rate, fetch_macro_snapshot
-from src.market_data import MarketDataError, fetch_adjusted_close, fetch_fundamentals, fetch_vix_snapshot, resample_prices
-from src.metrics import compute_returns, portfolio_returns, summarise_performance
-from src.optimization import efficient_frontier_points, forecast_mu, historical_mu_cov, optimize_max_sharpe, portfolio_performance
+from src.market_data import (
+    MarketDataError,
+    TwelveDataPlanRestricted,
+    fetch_adjusted_close,
+    fetch_fundamentals,
+    fetch_vix_snapshot,
+    resample_prices,
+)
+from src.metrics import apply_transaction_cost, compute_returns, compute_turnover, portfolio_returns, summarise_performance
+from src.optimization import (
+    efficient_frontier_points,
+    forecast_mu,
+    historical_mu_cov,
+    optimize_max_sharpe,
+    portfolio_performance,
+    resolve_weight_bounds,
+)
 
 st.set_page_config(page_title="Portfolio Forecasting & Optimization", layout="wide", page_icon="📈")
 
@@ -130,6 +147,26 @@ def render_sidebar() -> dict:
              "mathematically valid but not how any real portfolio is actually run. Automatically "
              "relaxed if it's tighter than 1/(number of assets selected).",
     )
+    allow_short_selling = st.sidebar.checkbox(
+        "Allow short selling", value=False,
+        help="Long-only by default (weights ≥ 0). Enabling this lets the optimizer take negative "
+             "(short) positions up to the same magnitude as the max-weight cap — e.g. with a 35% "
+             "cap, weights can range -35% to +35% per asset. Portfolio stays fully invested "
+             "(weights still sum to 100%); this does NOT add gross leverage beyond that. "
+             "Note: with few assets selected, a tight cap can leave no real room to short — e.g. "
+             "3 assets at a 35% cap can push a losing asset down to about +30% at most, never "
+             "negative, since the other two can only fund 70% of the portfolio between them. "
+             "More assets or a higher cap gives shorts more room to actually bind.",
+    )
+    transaction_cost_bps = st.sidebar.slider(
+        "Transaction cost (bps per rebalance)", 0, 50, int(DEFAULT_TRANSACTION_COST_BPS), 1,
+        help="Charged as turnover × this rate every time a portfolio rebalances — once for the "
+             "initial trade in the comparison above, and at every walk-forward window boundary "
+             "below (which is also, in effect, your rebalancing frequency: a shorter forecast "
+             "horizon means more windows, i.e. more frequent rebalancing, i.e. more cumulative "
+             "cost — try shortening the horizon to see this drag show up). Set to 0 for the "
+             "frictionless textbook comparison.",
+    )
     horizon_unit = {"daily": "trading days", "weekly": "weeks", "monthly": "months"}[frequency]
     forecast_horizon = st.sidebar.slider(
         f"Forecast horizon ({horizon_unit})", min_value=10, max_value=90, value=DEFAULT_FORECAST_HORIZON_DAYS, step=5,
@@ -152,6 +189,7 @@ def render_sidebar() -> dict:
         tickers=tickers, start_date=start_date, end_date=end_date, frequency=frequency,
         risk_free_rate=risk_free_rate, forecast_horizon=forecast_horizon, forecast_model=forecast_model,
         walk_forward_windows=walk_forward_windows, max_weight_per_asset=max_weight_per_asset,
+        allow_short_selling=allow_short_selling, transaction_cost_bps=transaction_cost_bps,
     )
 
 
@@ -202,6 +240,14 @@ def render_macro_panel() -> dict:
 
     if macro["three_month_yield"] is None or macro["ten_year_yield"] is None:
         st.caption("Set FRED_API_KEY in .env for live Treasury yields — see README.")
+        with st.expander("Debug: what this app process actually sees"):
+            key = LLM_SETTINGS.fred_api_key
+            if key:
+                st.write(f"FRED_API_KEY: configured, length={len(key)}, starts with `{key[:4]}...`")
+            else:
+                st.write("FRED_API_KEY: **not set / empty** in this running process's environment.")
+            st.write(f"Working directory: `{os.getcwd()}`")
+            st.write(f".env exists at that path: `{os.path.exists(os.path.join(os.getcwd(), '.env'))}`")
     st.caption(
         "The 10Y-3M spread turning negative has preceded every US recession since the 1960s "
         "(with some false positives) — shown here as context, not a trading signal in itself."
@@ -285,10 +331,21 @@ def render_overview_tab(prices: pd.DataFrame, tickers: list[str], periods_per_ye
             )
         progress = st.progress(0.0, text="Fetching fundamentals...")
         rows = []
+        plan_restricted = False
         for i, ticker in enumerate(tickers):
             if i > 0:
                 time.sleep(7.5)  # keeps us under Twelve Data's free-tier 8 req/min, proactively
-            f = fetch_fundamentals(ticker)
+            if plan_restricted:
+                # Already confirmed this plan can't use /statistics beyond the demo
+                # symbol — no point burning quota (or the user's time) retrying it
+                # per ticker; every subsequent call would just 403 identically.
+                f = None
+            else:
+                try:
+                    f = fetch_fundamentals(ticker)
+                except TwelveDataPlanRestricted:
+                    plan_restricted = True
+                    f = None
             progress.progress((i + 1) / len(tickers), text=f"Fetching fundamentals... ({i + 1}/{len(tickers)})")
             rows.append({
                 "Ticker": ticker,
@@ -305,7 +362,15 @@ def render_overview_tab(prices: pd.DataFrame, tickers: list[str], periods_per_ye
             })
         progress.empty()
         st.dataframe(pd.DataFrame(rows).set_index("Ticker"), width='stretch')
-        if all(r["Market cap"] == "—" and r["P/E (trailing)"] == "—" for r in rows):
+        if plan_restricted:
+            st.warning(
+                "Your Twelve Data plan only includes `/statistics` for their public demo symbol "
+                "(AAPL) — every other ticker returns a 403 'requires pro/ultra/venture/enterprise "
+                "plan' error, confirmed directly against the API. This is a plan limitation, not "
+                "a bug: see [twelvedata.com/pricing](https://twelvedata.com/pricing) if you want "
+                "fundamentals for more than one demo ticker."
+            )
+        elif all(r["Market cap"] == "—" and r["P/E (trailing)"] == "—" for r in rows):
             st.warning(
                 "No fundamentals fields came back for any ticker — this likely means your "
                 "Twelve Data plan doesn't include the `/statistics` endpoint's fields. "
@@ -315,10 +380,11 @@ def render_overview_tab(prices: pd.DataFrame, tickers: list[str], periods_per_ye
 
 def render_frontier_tab(
     prices: pd.DataFrame, tickers: list[str], risk_free_rate: float, periods_per_year: int, max_weight_per_asset: float,
+    allow_short_selling: bool,
 ) -> pd.Series:
     st.subheader("Mean-variance efficient frontier (historical)")
     mu, cov = historical_mu_cov(prices[tickers], periods_per_year)
-    weight_bounds = (0.0, max_weight_per_asset)
+    weight_bounds = resolve_weight_bounds(max_weight_per_asset, allow_short_selling)
     weights = optimize_max_sharpe(mu, cov, risk_free_rate=risk_free_rate, weight_bounds=weight_bounds)
     perf = portfolio_performance(mu, cov, weights, risk_free_rate)
     frontier = efficient_frontier_points(mu, cov, weight_bounds=weight_bounds)
@@ -396,7 +462,7 @@ def render_forecast_compare_tab(
     with st.spinner(f"Fitting {config['forecast_model']} per asset..."):
         forecasted_prices = forecast_all_assets(train_prices[tickers], horizon, config["forecast_model"])
 
-    weight_bounds = (0.0, config["max_weight_per_asset"])
+    weight_bounds = resolve_weight_bounds(config["max_weight_per_asset"], config["allow_short_selling"])
 
     # --- 1. Historical-optimal (trained on train_prices only) ---
     mu_hist, cov_hist = historical_mu_cov(train_prices[tickers], periods_per_year)
@@ -415,10 +481,14 @@ def render_forecast_compare_tab(
     test_benchmark_returns = (
         compute_returns(test_prices[[BENCHMARK_TICKER]])[BENCHMARK_TICKER] if BENCHMARK_TICKER in prices.columns else None
     )
-    realized_metrics = {
-        name: summarise_performance(portfolio_returns(test_returns, w), rf, periods_per_year, test_benchmark_returns)
-        for name, w in portfolios.items()
-    }
+    cost_bps = config["transaction_cost_bps"]
+    realized_metrics = {}
+    for name, w in portfolios.items():
+        port_returns = portfolio_returns(test_returns, w)
+        if cost_bps > 0:
+            turnover = compute_turnover(w, None)  # starting from cash — establishing this position from scratch
+            port_returns = apply_transaction_cost(port_returns, turnover, cost_bps)
+        realized_metrics[name] = summarise_performance(port_returns, rf, periods_per_year, test_benchmark_returns)
 
     st.subheader(f"Out-of-sample comparison — last {horizon} periods")
     st.caption(
@@ -519,7 +589,7 @@ def render_walk_forward_section(prices: pd.DataFrame, tickers: list[str], config
         results = run_walk_forward(
             prices, tickers, horizon, n_windows, config["forecast_model"],
             config["risk_free_rate"], periods_per_year, WALK_FORWARD_MIN_TRAIN_PERIODS,
-            config["max_weight_per_asset"],
+            config["max_weight_per_asset"], config["allow_short_selling"], config["transaction_cost_bps"],
         )
 
     fig = go.Figure()
@@ -590,6 +660,7 @@ def render_ai_analyst_tab(
                 }
                 digest, backend, articles = generate_news_digest(tickers, company_names)
                 st.session_state["news"] = (digest, backend, articles)
+                st.session_state["news_chunks"] = build_chunks(articles)
         if "news" in st.session_state:
             digest, backend, articles = st.session_state["news"]
             st.write(digest)
@@ -621,7 +692,8 @@ def render_ai_analyst_tab(
             with st.spinner("Thinking..."):
                 try:
                     answer, backend = answer_portfolio_question(
-                        question, st.session_state["results_context"], st.session_state["chat_history"][:-1]
+                        question, st.session_state["results_context"], st.session_state["chat_history"][:-1],
+                        st.session_state.get("news_chunks"),
                     )
                     st.write(answer)
                     st.caption(f"Generated by: {backend}")
@@ -662,6 +734,7 @@ def main() -> None:
     with tab_frontier:
         weights = render_frontier_tab(
             prices, config["tickers"], config["risk_free_rate"], periods_per_year, config["max_weight_per_asset"],
+            config["allow_short_selling"],
         )
 
     with tab_compare:

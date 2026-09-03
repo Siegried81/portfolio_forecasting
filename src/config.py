@@ -13,7 +13,11 @@ from dataclasses import dataclass, field
 
 from dotenv import load_dotenv
 
-load_dotenv()  # no-op in prod (Render/Streamlit Cloud inject env vars directly)
+load_dotenv(override=True)  # override=True: .env values win over any pre-existing shell-level
+# env vars of the same name (even an empty/stale one) — the default (override=False) would
+# silently keep a blank shell variable and ignore .env, which is exactly the kind of "the key
+# is definitely in .env but the app still sees nothing" bug this project hit in practice.
+# No-op in prod (Render/Streamlit Cloud inject env vars directly, no .env file exists there).
 
 # --- Default investable universe -------------------------------------------------
 # Individual equities: liquid, well-covered US large caps (matches the brief's examples).
@@ -95,6 +99,14 @@ DEFAULT_RISK_FREE_RATE: float = 0.04  # ~US T-bill yield, override in the UI if 
 DEFAULT_MAX_WEIGHT_PER_ASSET: float = 0.35
 TRADING_DAYS_PER_YEAR: int = 252
 MONTHS_PER_YEAR: int = 12
+
+# Transaction cost charged (as turnover × this rate) each time a portfolio
+# rebalances — i.e. at every walk-forward window boundary, and once for the
+# initial trade into the single-window comparison. 10 bps (0.10%) is a
+# reasonable retail/liquid-ETF assumption; institutional desks on large-cap
+# names can be lower, illiquid names higher. Set to 0 in the UI to see the
+# frictionless (textbook) comparison.
+DEFAULT_TRANSACTION_COST_BPS: float = 10.0
 
 FREQUENCY_TO_PERIODS_PER_YEAR: dict[str, int] = {
     "daily": TRADING_DAYS_PER_YEAR,

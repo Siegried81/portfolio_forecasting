@@ -258,3 +258,42 @@ def summarise_performance(
         summary["information_ratio"] = information_ratio(returns, benchmark_returns, periods_per_year)
         summary["treynor_ratio"] = treynor_ratio(returns, beta, risk_free_rate, periods_per_year)
     return summary
+
+
+def compute_turnover(new_weights: pd.Series, old_weights: pd.Series | None) -> float:
+    """
+    Sum of absolute weight changes when rebalancing from `old_weights` to
+    `new_weights` — the standard turnover measure a transaction-cost estimate is
+    built on (cost ≈ turnover × cost rate). `old_weights=None` means starting
+    from all-cash (e.g. the very first rebalance in a backtest), in which case
+    turnover is simply the sum of the new weights' magnitudes (everything has to
+    be bought from scratch).
+    """
+    if old_weights is None:
+        return float(new_weights.abs().sum())
+    idx = new_weights.index.union(old_weights.index)
+    diff = new_weights.reindex(idx, fill_value=0.0) - old_weights.reindex(idx, fill_value=0.0)
+    return float(diff.abs().sum())
+
+
+def apply_transaction_cost(returns: pd.Series, turnover: float, cost_bps: float) -> pd.Series:
+    """
+    Charge a one-time transaction cost (turnover × cost rate) against a return
+    series, applied at the moment of rebalancing — i.e. against the FIRST period
+    of the series, since that's when the trades to reach the new weights
+    actually happen. Multiplicative (not a flat subtraction): the cost eats into
+    whatever wealth exists at that point, which compounds correctly with the
+    rest of the series rather than becoming a slightly-wrong flat percentage
+    shift.
+
+    `cost_bps` is in basis points (1 bp = 0.01%) — typical retail/ETF trading
+    costs are in the 1-20 bps range per trade; institutional desks can be lower
+    for liquid large-caps, higher for illiquid names. Returns an unmodified copy
+    if the series is empty or turnover/cost is zero.
+    """
+    if len(returns) == 0 or turnover == 0 or cost_bps == 0:
+        return returns.copy()
+    cost = turnover * cost_bps / 10_000
+    adjusted = returns.copy()
+    adjusted.iloc[0] = (1.0 + adjusted.iloc[0]) * (1.0 - cost) - 1.0
+    return adjusted

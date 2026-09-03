@@ -179,26 +179,59 @@ def generate_news_digest(tickers: list[str], company_names: dict[str, str]) -> t
     return text, backend, all_articles
 
 
-def answer_portfolio_question(question: str, results_context: str, chat_history: list[dict]) -> tuple[str, str]:
+def answer_portfolio_question(
+    question: str, results_context: str, chat_history: list[dict], news_chunks: list | None = None,
+) -> tuple[str, str]:
     """
     Grounded Q&A: answers are constrained to the computed results context plus
     ordinary finance knowledge for explaining concepts (e.g. "what is Sortino
     ratio") — but the system prompt explicitly forbids fabricating numbers not
     present in the context, which is the main hallucination risk for a finance
     tool (a confidently wrong Sharpe ratio is worse than no answer).
+
+    `news_chunks` (from src.rag.build_chunks, built once after fetching the news
+    digest) enables genuine RAG for questions ABOUT news/filings rather than the
+    portfolio numbers: only the top-k chunks relevant to THIS specific question
+    are retrieved and injected, not the entire news corpus on every turn. This
+    is a real index-then-retrieve pipeline, not a rebrand of the metrics
+    context-injection above — see src/rag.py's docstring for why the two use
+    different approaches (small fixed structured data vs. a growable
+    unstructured corpus).
     """
+    retrieved_block = ""
+    if news_chunks:
+        from src.rag import format_retrieved_chunks, retrieve
+        relevant = retrieve(question, news_chunks, top_k=4)
+        retrieved_block = format_retrieved_chunks(relevant)
+
+    system_content = (
+        SYSTEM_PERSONA
+        + "\n\nYou may explain general finance concepts (e.g. what Sharpe ratio "
+        "means) from your own knowledge. But any SPECIFIC NUMBER about THIS "
+        "portfolio must come from the context below - if asked about a number "
+        "not present there, say it isn't available rather than estimating it.\n\n"
+        "CRITICAL — if the user pastes a bare sequence of numbers (e.g. '16.7% "
+        "28.1% 0.55 0.56...') without saying which metric each one is, DO NOT "
+        "guess an order or say a number 'is likely to represent' some metric. "
+        "That is hallucination by another name — matching numbers to labels by "
+        "assumed position is exactly the kind of unstated guess this app exists "
+        "to avoid. Instead: (1) check whether the pasted numbers match a row in "
+        "the context above for the ticker/portfolio they named — if they match "
+        "exactly, confirm the mapping explicitly ('these correspond to X, Y, Z ' "
+        "from the table below') rather than silently assuming it; (2) if they "
+        "don't clearly match, or there are more numbers than you can confidently "
+        "map, ask the user to state which number is which metric before explaining "
+        "any of them."
+        "\n\n" + results_context
+    )
+    if retrieved_block:
+        system_content += (
+            "\n\nIf the question is about news/filings, use ONLY the retrieved items below — "
+            "if nothing relevant was retrieved, say so rather than inventing news.\n\n" + retrieved_block
+        )
+
     messages = [
-        {
-            "role": "system",
-            "content": (
-                SYSTEM_PERSONA
-                + "\n\nYou may explain general finance concepts (e.g. what Sharpe ratio "
-                "means) from your own knowledge. But any SPECIFIC NUMBER about THIS "
-                "portfolio must come from the context below - if asked about a number "
-                "not present there, say it isn't available rather than estimating it."
-                "\n\n" + results_context
-            ),
-        },
+        {"role": "system", "content": system_content},
         *chat_history,
         {"role": "user", "content": question},
     ]
