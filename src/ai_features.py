@@ -12,10 +12,12 @@ handful of numbers that already fit in a prompt.
 """
 from __future__ import annotations
 
+import concurrent.futures
+
 import pandas as pd
 
 from src.llm_client import chat, truncate_to_token_budget
-from src.news_data import fetch_finnhub_news, fetch_sec_filings, fetch_ticker_headlines
+from src.news_data import fetch_finnhub_news, fetch_sec_filings, fetch_ticker_headlines, get_ticker_sentiment
 
 SYSTEM_PERSONA = (
     "You are a CFA-level portfolio analyst writing for an informed but non-technical "
@@ -88,6 +90,18 @@ def build_results_context(
             spread = macro["term_spread_10y_3m"]
             note = " (INVERTED — a historical recession signal)" if spread < 0 else ""
             macro_lines.append(f"  10Y-3M term spread: {spread:+.2%}{note}")
+        if macro.get("cpi_yoy_inflation") is not None:
+            macro_lines.append(f"  CPI inflation (year-over-year): {macro['cpi_yoy_inflation']:.2%}")
+        if macro.get("unemployment_rate") is not None:
+            macro_lines.append(f"  Unemployment rate: {macro['unemployment_rate']:.2%}")
+        if macro.get("fed_funds_rate") is not None:
+            macro_lines.append(f"  Fed funds rate (effective, daily): {macro['fed_funds_rate']:.2%}")
+        if macro.get("sahm_rule_indicator") is not None:
+            sahm = macro["sahm_rule_indicator"]
+            note = " (>=0.50 — has historically marked the start of every US recession since 1970)" if sahm >= 0.50 else ""
+            macro_lines.append(f"  Sahm Rule recession indicator: {sahm:.2f}{note}")
+        if macro.get("credit_spread_baa10y") is not None:
+            macro_lines.append(f"  Baa corporate credit spread (vs 10Y Treasury): {macro['credit_spread_baa10y']:.2%}")
         if vix is not None:
             regime = "calm" if vix < 15 else "normal" if vix < 25 else "elevated"
             macro_lines.append(f"  VIX (market fear gauge): {vix:.1f} ({regime})")
@@ -107,7 +121,9 @@ def generate_commentary(results_context: str) -> tuple[str, str]:
             "role": "user",
             "content": (
                 "Write a concise (150-200 words) portfolio commentary based ONLY on the "
-                "data below. Cover: (1) what drove the historical allocation, (2) how the "
+                "data below. Cover EXACTLY these four points, in this order, and do not add "
+                "a fifth section or a separate conclusion/take-away beyond them: "
+                "(1) what drove the historical allocation, (2) how the "
                 "forecast-based portfolio compares to the realized-optimal benchmark and "
                 "what that gap implies about forecast reliability, (3) one concrete risk "
                 "to flag (drawdown, concentration, or volatility), and (4) if a macro "
@@ -118,31 +134,69 @@ def generate_commentary(results_context: str) -> tuple[str, str]:
             ),
         },
     ]
-    return chat(messages, temperature=0.4, max_tokens=400)
+    return chat(messages, temperature=0.4, max_tokens=4000)
 
 
-def generate_news_digest(tickers: list[str], company_names: dict[str, str]) -> tuple[str, str, list[dict]]:
+def _fetch_all_sources_for_ticker(ticker: str, company: str | None) -> tuple[str, list[dict], dict | None]:
+    """One ticker's worth of the three-source fetch, plus sentiment — factored
+    out so it can run inside a thread pool. Each individual fetcher already
+    fails soft (returns []/None), so this never raises. Sentiment is computed
+    HERE (not in a separate pass afterwards) so it rides the same thread pool
+    round-trip instead of adding a second sequential wait per ticker."""
+    articles = (
+        fetch_ticker_headlines(ticker, company)
+        + fetch_finnhub_news(ticker)
+        + (fetch_sec_filings(company, ticker) if company else [])
+    )
+    for a in articles:
+        a["ticker"] = ticker
+    sentiment = get_ticker_sentiment(ticker, articles)
+    return ticker, articles, sentiment
+
+
+def generate_news_digest(
+    tickers: list[str], company_names: dict[str, str],
+) -> tuple[str, str, list[dict], dict[str, dict | None]]:
     """
     Fetch recent headlines/filings per ticker from THREE sources — NewsAPI
     (general media), Finnhub (dedicated financial news), SEC EDGAR (primary
     regulatory filings) — and ask the LLM for a short digest that cross-
     references them rather than relying on a single provider's coverage.
 
-    Returns (digest_text, backend_used, raw_articles) — raw_articles are kept so
-    the UI can render clickable source links (the LLM output alone should never
-    be the only trace of a claim; always show the reader where it came from).
+    PARALLELIZED (2026-09-04) across tickers with a thread pool: this used to
+    be 3 sequential HTTP calls PER ticker (up to ~15s wall-clock for a 5-ticker
+    universe even with fast providers). This is pure I/O wait, not CPU work,
+    so a thread pool gives a near-linear speedup with no GIL concern — a
+    5-ticker digest now takes roughly as long as the single slowest ticker's
+    calls, not the sum of all of them. `max_workers` capped at 8 for the
+    same reason as forecast_all_assets: don't oversubscribe a small container.
+
+    Returns (digest_text, backend_used, raw_articles, sentiment_by_ticker).
+    raw_articles are kept so the UI can render clickable source links (the LLM
+    output alone should never be the only trace of a claim; always show the
+    reader where it came from). `sentiment_by_ticker` maps each ticker to a
+    dict from `news_data.get_ticker_sentiment` (Finnhub aggregated, or VADER
+    computed locally, tagged by `provider` either way) or None if nothing was
+    available at all — callers must show an explicit "not available" message
+    on None, not a silent blank.
     """
+    max_workers = min(8, len(tickers)) or 1
+    results: dict[str, tuple[list[dict], dict | None]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_fetch_all_sources_for_ticker, ticker, company_names.get(ticker)): ticker
+            for ticker in tickers
+        }
+        for future in concurrent.futures.as_completed(futures):
+            ticker, articles, sentiment = future.result()
+            results[ticker] = (articles, sentiment)
+
     all_articles: list[dict] = []
     news_block_parts = []
-    for ticker in tickers:
-        company = company_names.get(ticker)
-        articles = (
-            fetch_ticker_headlines(ticker, company)
-            + fetch_finnhub_news(ticker)
-            + (fetch_sec_filings(company, ticker) if company else [])
-        )
-        for a in articles:
-            a["ticker"] = ticker
+    sentiment_by_ticker: dict[str, dict | None] = {}
+    for ticker in tickers:  # iterate in the ORIGINAL order, not completion order,
+        articles, sentiment = results.get(ticker, ([], None))  # so output reads the same every run
+        sentiment_by_ticker[ticker] = sentiment
         all_articles.extend(articles)
         if articles:
             headlines = "\n".join(f"  - [{a['provider']}] {a['title']} ({a['source']})" for a in articles)
@@ -155,6 +209,7 @@ def generate_news_digest(tickers: list[str], company_names: dict[str, str]) -> t
             "free tier's quota may be exhausted.",
             "n/a",
             [],
+            sentiment_by_ticker,  # still populated per-ticker (all None here, since no articles)
         )
 
     news_block = truncate_to_token_budget("\n\n".join(news_block_parts))
@@ -175,8 +230,8 @@ def generate_news_digest(tickers: list[str], company_names: dict[str, str]) -> t
             ),
         },
     ]
-    text, backend = chat(messages, temperature=0.3, max_tokens=350)
-    return text, backend, all_articles
+    text, backend = chat(messages, temperature=0.3, max_tokens=4000)
+    return text, backend, all_articles, sentiment_by_ticker
 
 
 def answer_portfolio_question(
@@ -235,4 +290,4 @@ def answer_portfolio_question(
         *chat_history,
         {"role": "user", "content": question},
     ]
-    return chat(messages, temperature=0.2, max_tokens=350)
+    return chat(messages, temperature=0.2, max_tokens=4000)

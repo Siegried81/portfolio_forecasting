@@ -43,23 +43,28 @@ OPTIONAL_ETF_TICKERS: list[str] = [
 ]
 
 # --- Broader S&P 500 universe, organised by GICS sector -----------------------------
-# A curated ~45-name subset (not all 500 — see README for why: covariance estimation
-# degrades badly with hundreds of names and a few years of daily data; real buy-side
-# desks use factor models or sector-constrained universes for exactly this reason,
-# not a raw 500x500 mean-variance optimisation). Each sector has enough names to
-# build a genuinely diversified sub-portfolio, not just one or two tokens.
+# A curated 104-name subset (expanded 2026-09 from ~59, still not all 500 — see README
+# for why: covariance estimation degrades badly with hundreds of names and a few years
+# of daily data; real buy-side desks use factor models or sector-constrained universes
+# for exactly this reason, not a raw 500x500 mean-variance optimisation). Each sector
+# has 7-12 liquid large-caps — enough for a genuinely diversified sub-portfolio, not
+# just one or two tokens. Materials/Real Estate/Utilities sit at 7 each: an honest
+# reflection of how few S&P mega-caps those sectors actually contain, not an oversight.
+# For universes at the wide end of this range (~40+ names), see the PCA factor-model
+# covariance option in optimization.py/factor_models.py — the tractable alternative to
+# raw sample/shrinkage covariance once N gets large relative to the history available.
 SP500_SECTOR_UNIVERSE: dict[str, list[str]] = {
-    "Technology": ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "CRM", "ADBE", "AMD"],
-    "Communication Services": ["GOOGL", "META", "NFLX", "DIS", "TMUS", "VZ"],
-    "Consumer Discretionary": ["AMZN", "TSLA", "HD", "MCD", "NKE", "LOW"],
-    "Consumer Staples": ["PG", "KO", "PEP", "WMT", "COST", "PM"],
-    "Financials": ["JPM", "BAC", "WFC", "GS", "MS", "V", "MA"],
-    "Healthcare": ["UNH", "JNJ", "LLY", "ABBV", "PFE", "MRK", "TMO"],
-    "Industrials": ["CAT", "HON", "UNP", "BA", "GE", "RTX"],
-    "Energy": ["XOM", "CVX", "COP", "SLB"],
-    "Materials": ["LIN", "SHW", "APD"],
-    "Real Estate": ["PLD", "AMT", "EQIX"],
-    "Utilities": ["NEE", "DUK", "SO"],
+    "Technology": ["AAPL", "MSFT", "NVDA", "AVGO", "ORCL", "CRM", "ADBE", "AMD", "CSCO", "INTC", "IBM", "QCOM"],
+    "Communication Services": ["GOOGL", "META", "NFLX", "DIS", "TMUS", "VZ", "CMCSA", "T", "CHTR", "EA"],
+    "Consumer Discretionary": ["AMZN", "TSLA", "HD", "MCD", "NKE", "LOW", "SBUX", "BKNG", "TJX", "CMG"],
+    "Consumer Staples": ["PG", "KO", "PEP", "WMT", "COST", "PM", "MO", "MDLZ", "CL", "KMB"],
+    "Financials": ["JPM", "BAC", "WFC", "GS", "MS", "V", "MA", "AXP", "SCHW", "BLK", "C"],
+    "Healthcare": ["UNH", "JNJ", "LLY", "ABBV", "PFE", "MRK", "TMO", "ABT", "DHR", "BMY", "AMGN"],
+    "Industrials": ["CAT", "HON", "UNP", "BA", "GE", "RTX", "LMT", "DE", "UPS", "ADP"],
+    "Energy": ["XOM", "CVX", "COP", "SLB", "EOG", "MPC", "PSX", "OXY", "WMB"],
+    "Materials": ["LIN", "SHW", "APD", "ECL", "FCX", "NEM", "DOW"],
+    "Real Estate": ["PLD", "AMT", "EQIX", "CCI", "PSA", "SPG", "O"],
+    "Utilities": ["NEE", "DUK", "SO", "D", "AEP", "EXC", "SRE"],
 }
 
 # Quick-select preset: largest-cap, most-recognised names across sectors — the
@@ -99,6 +104,25 @@ DEFAULT_RISK_FREE_RATE: float = 0.04  # ~US T-bill yield, override in the UI if 
 DEFAULT_MAX_WEIGHT_PER_ASSET: float = 0.35
 TRADING_DAYS_PER_YEAR: int = 252
 MONTHS_PER_YEAR: int = 12
+
+# --- Covariance estimation method (added 2026-09) -----------------------------------
+# Ledoit-Wolf shrinkage (the long-standing default) is a solid fix for a SMALL
+# universe's noisy sample covariance. It stops being enough once the universe gets
+# wide relative to the history available (see SP500_SECTOR_UNIVERSE's comment above,
+# and README's "Why not all 500 S&P constituents") — a PCA statistical factor model
+# is the tractable alternative at that point, same core idea real buy-side desks use
+# (Barra, APT), just the lighter statistical version rather than a fundamental one
+# with pre-specified style factors. Both live behind one config switch so every
+# call site (frontier, single-window comparison, walk-forward) stays consistent.
+COV_METHOD_LEDOIT_WOLF: str = "ledoit_wolf"
+COV_METHOD_PCA: str = "pca"
+DEFAULT_COV_METHOD: str = COV_METHOD_LEDOIT_WOLF
+DEFAULT_PCA_FACTORS: int = 10  # a common rule-of-thumb starting point (Fama-French-
+# scale factor counts run 3-6; statistical factor models for broad equity universes
+# typically land in the 10-20 range) — the UI shows cumulative explained variance so
+# the user can judge whether this default is capturing enough for their universe.
+MIN_PCA_FACTORS: int = 2
+MAX_PCA_FACTORS: int = 30
 
 # Transaction cost charged (as turnover × this rate) each time a portfolio
 # rebalances — i.e. at every walk-forward window boundary, and once for the

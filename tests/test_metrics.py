@@ -16,12 +16,16 @@ from src.metrics import (
     calmar_ratio,
     conditional_value_at_risk,
     information_ratio,
+    jensens_alpha,
     max_drawdown,
     omega_ratio,
+    return_kurtosis,
+    return_skewness,
     sharpe_ratio,
     sortino_ratio,
     summarise_performance,
     treynor_ratio,
+    ulcer_index,
     value_at_risk,
 )
 
@@ -153,3 +157,90 @@ def test_summarise_performance_includes_benchmark_metrics_only_when_provided():
 
     with_benchmark = summarise_performance(returns, periods_per_year=252, benchmark_returns=benchmark)
     assert "information_ratio" in with_benchmark and "treynor_ratio" in with_benchmark and "beta" in with_benchmark
+    assert "jensens_alpha" in with_benchmark
+
+
+def test_jensens_alpha_zero_when_portfolio_exactly_matches_capm_prediction():
+    # Construct a portfolio whose return is EXACTLY rf + beta*(Rm - rf) at every
+    # period (beta=1.5, rf=0 for a clean single-period hand check) -> alpha must be 0.
+    benchmark = pd.Series([0.10])  # single period, 10% benchmark return
+    beta = 1.5
+    rf = 0.0
+    portfolio_return = rf + beta * (0.10 - rf)  # = 0.15
+    portfolio = pd.Series([portfolio_return])
+    alpha = jensens_alpha(portfolio, benchmark, beta=beta, risk_free_rate=rf, periods_per_year=1)
+    assert alpha == pytest.approx(0.0, abs=1e-9)
+
+
+def test_jensens_alpha_positive_when_outperforming_capm_prediction():
+    benchmark = pd.Series([0.10])
+    beta = 1.0
+    rf = 0.0
+    # CAPM would predict exactly the benchmark return (beta=1) -> anything above it is alpha
+    portfolio = pd.Series([0.14])
+    alpha = jensens_alpha(portfolio, benchmark, beta=beta, risk_free_rate=rf, periods_per_year=1)
+    assert alpha == pytest.approx(0.04, abs=1e-9)
+
+
+def test_jensens_alpha_nan_when_beta_is_nan():
+    benchmark = pd.Series([0.10, 0.05])
+    portfolio = pd.Series([0.08, 0.03])
+    assert np.isnan(jensens_alpha(portfolio, benchmark, beta=float("nan"), periods_per_year=1))
+
+
+# ---------------------------------------------------------------------------
+# ulcer_index
+# ---------------------------------------------------------------------------
+
+def test_ulcer_index_zero_for_monotonic_gains():
+    # Wealth curve never dips below a prior peak -> every drawdown point is 0.
+    returns = pd.Series([0.01, 0.02, 0.015])
+    assert ulcer_index(returns) == pytest.approx(0.0, abs=1e-9)
+
+
+def test_ulcer_index_distinguishes_duration_from_max_drawdown():
+    # Both series first rise (establishing an explicit peak WITHIN the series —
+    # max_drawdown()'s running peak comes from cummax() over the series itself,
+    # so a drop on period 0 has no prior peak to be measured against and would
+    # score a false zero). Both then drop 20% from that peak, share the exact
+    # same Max Drawdown — but the first stays underwater for 3 periods while
+    # the second recovers immediately.
+    long_underwater = pd.Series([0.05, -0.20, 0.0, 0.0, 0.15])
+    quick_recovery = pd.Series([0.05, -0.20, 0.15, 0.0, 0.0])
+    ui_long = ulcer_index(long_underwater)
+    ui_quick = ulcer_index(quick_recovery)
+    assert max_drawdown(long_underwater) == pytest.approx(max_drawdown(quick_recovery), abs=1e-6)
+    assert ui_long > ui_quick
+
+
+# ---------------------------------------------------------------------------
+# return_skewness / return_kurtosis
+# ---------------------------------------------------------------------------
+
+def test_return_skewness_negative_for_left_tailed_series():
+    # Many small gains, one large loss -> classic negative-skew equity shape.
+    returns = pd.Series([0.01, 0.01, 0.01, 0.01, 0.01, 0.01, 0.01, -0.15])
+    assert return_skewness(returns) < 0
+
+
+def test_return_skewness_positive_for_right_tailed_series():
+    returns = pd.Series([-0.01, -0.01, -0.01, -0.01, -0.01, -0.01, -0.01, 0.15])
+    assert return_skewness(returns) > 0
+
+
+def test_return_kurtosis_higher_for_fatter_tailed_series():
+    # Same mean and similar spread, but one series has an extreme outlier
+    # (fat tail) the other doesn't -> higher excess kurtosis for the outlier series.
+    normal_ish = pd.Series([0.00, 0.01, -0.01, 0.02, -0.02, 0.01, -0.01, 0.00])
+    fat_tailed = pd.Series([0.00, 0.01, -0.01, 0.02, -0.02, 0.01, -0.01, 0.25])
+    assert return_kurtosis(fat_tailed) > return_kurtosis(normal_ish)
+
+
+def test_summarise_performance_always_includes_ulcer_skew_kurtosis():
+    np.random.seed(21)
+    returns = pd.Series(np.random.normal(0.0005, 0.012, 100))
+    summary = summarise_performance(returns, periods_per_year=252)
+    assert "ulcer_index" in summary
+    assert "skewness" in summary
+    assert "kurtosis" in summary
+    assert summary["ulcer_index"] >= 0

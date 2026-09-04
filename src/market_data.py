@@ -51,6 +51,16 @@ TWELVEDATA_BACKOFF_SECONDS = 20.0  # doubles each retry: 20s, 40s — 429 free-t
 YFINANCE_MAX_ATTEMPTS = 3
 YFINANCE_BACKOFF_SECONDS = 2.0  # doubles each retry: 2s, 4s
 
+# Circuit breaker: once BOTH Yahoo paths (yfinance library + direct API) fail in
+# the same call, skip re-attempting Yahoo entirely for this long — avoids paying
+# the full multi-second retry cost again on every Streamlit rerun (every widget
+# interaction) while Yahoo is known to be down for this process. Module-level
+# (not per-request), on purpose: the whole point is state that survives across
+# separate `fetch_adjusted_close` calls within the same running process.
+YAHOO_CIRCUIT_BREAKER_SECONDS = 180.0  # 3 minutes — long enough to skip a burst of
+# rapid interactions, short enough to retry Yahoo again well within one debugging session
+_yahoo_down_until: float = 0.0
+
 
 class MarketDataError(RuntimeError):
     """Raised when price data cannot be retrieved from ANY source."""
@@ -190,8 +200,16 @@ def _download_twelvedata(tickers: list[str], start: dt.date, end: dt.date) -> pd
     if payload.get("status") == "error" or "code" in payload and "message" in payload and "values" not in payload:
         raise MarketDataError(f"Twelve Data error: {payload.get('message', payload)}")
 
-    # Normalise both response shapes into {ticker: {"values": [...]}}
-    per_ticker = payload if len(tickers) > 1 and all(t in payload for t in tickers) else {tickers[0]: payload}
+    # Normalise both response shapes into {ticker: {"values": [...]}}.
+    # BUGFIX (2026-09-04): the previous check `all(t in payload for t in tickers)`
+    # required EVERY requested ticker to be present as a key. If Twelve Data drops
+    # one bad/delisted symbol from a multi-ticker batch response instead of keeping
+    # it as an error-tagged key, that check silently failed and the code wrapped the
+    # WHOLE multi-ticker payload as {tickers[0]: payload} — mis-parsing every ticker,
+    # not just the missing one. Detect the shape directly instead: a single-ticker
+    # response has "values"/"meta" at the TOP level; a multi-ticker response is a
+    # dict keyed by symbol, each holding that shape one level down.
+    per_ticker = {tickers[0]: payload} if ("values" in payload or "meta" in payload) else payload
 
     columns = {}
     for ticker in tickers:
@@ -225,6 +243,17 @@ def fetch_adjusted_close(
     (not Yahoo itself) is what's failing; (3) Twelve Data, a genuinely different
     provider, as the real fallback once both Yahoo-based attempts are exhausted.
 
+    Circuit breaker: Streamlit reruns the WHOLE script on every widget
+    interaction — adding one ticker, moving a slider — which means a naive
+    implementation re-attempts the full Yahoo retry sequence (up to 6 failed
+    calls with backoff sleeps) on every single interaction while Yahoo is down,
+    even though the previous attempt (seconds ago) already proved it's down.
+    Once both Yahoo paths fail, `_yahoo_down_until` records "don't bother
+    retrying Yahoo before this time" — subsequent calls within that window skip
+    straight to Twelve Data. This is a genuine responsiveness fix, not just log
+    noise reduction: observed in practice, a user rapidly toggling tickers while
+    Yahoo was down was hitting the full multi-second retry chain on every click.
+
     Returns a DataFrame indexed by date, one column per ticker, forward-filled for
     isolated missing sessions (holidays that differ slightly across exchanges/ETFs)
     but NOT filled at the edges - leading/trailing NaNs are dropped so every column
@@ -233,25 +262,34 @@ def fetch_adjusted_close(
     if not tickers:
         raise MarketDataError("No tickers provided.")
 
+    global _yahoo_down_until
+    skip_yahoo = time.monotonic() < _yahoo_down_until
+
     source = "yfinance"
-    try:
-        raw = _download_yfinance(tickers, start, end)
-        if isinstance(raw.columns, pd.MultiIndex):
-            prices = pd.concat(
-                {t: raw[t]["Close"] for t in tickers if t in raw.columns.get_level_values(0)},
-                axis=1,
-            )
-        else:
-            prices = raw[["Close"]].rename(columns={"Close": tickers[0]})
-    except MarketDataError as yfinance_error:
-        logger.warning("yfinance library failed, trying direct Yahoo API: %s", yfinance_error)
+    if skip_yahoo:
+        logger.info("Yahoo circuit breaker active (down recently) — skipping straight to Twelve Data.")
+        source = "twelvedata (yahoo recently unavailable)"
+        prices = _download_twelvedata(tickers, start, end)
+    else:
         try:
-            prices = _download_yahoo_direct(tickers, start, end)
-            source = "yahoo direct API"
-        except MarketDataError as yahoo_direct_error:
-            logger.warning("Direct Yahoo API also failed, falling back to Twelve Data: %s", yahoo_direct_error)
-            source = "twelvedata (yahoo unavailable)"
-            prices = _download_twelvedata(tickers, start, end)
+            raw = _download_yfinance(tickers, start, end)
+            if isinstance(raw.columns, pd.MultiIndex):
+                prices = pd.concat(
+                    {t: raw[t]["Close"] for t in tickers if t in raw.columns.get_level_values(0)},
+                    axis=1,
+                )
+            else:
+                prices = raw[["Close"]].rename(columns={"Close": tickers[0]})
+        except MarketDataError as yfinance_error:
+            logger.warning("yfinance library failed, trying direct Yahoo API: %s", yfinance_error)
+            try:
+                prices = _download_yahoo_direct(tickers, start, end)
+                source = "yahoo direct API"
+            except MarketDataError as yahoo_direct_error:
+                logger.warning("Direct Yahoo API also failed, falling back to Twelve Data: %s", yahoo_direct_error)
+                _yahoo_down_until = time.monotonic() + YAHOO_CIRCUIT_BREAKER_SECONDS
+                source = "twelvedata (yahoo unavailable)"
+                prices = _download_twelvedata(tickers, start, end)
 
     missing = set(tickers) - set(prices.columns)
     if missing:
@@ -311,25 +349,14 @@ def fetch_vix_snapshot(lookback_days: int = 90) -> pd.Series | None:
 TWELVEDATA_STATISTICS_URL = "https://api.twelvedata.com/statistics"
 
 
-@st.cache_data(show_spinner=False, ttl=6 * 3600)
-def fetch_fundamentals(ticker: str) -> dict | None:
+def _fetch_twelvedata_fundamentals(ticker: str) -> dict | None:
     """
-    Per-ticker fundamentals (P/E, market cap, dividend yield, beta) via Twelve
-    Data's /statistics endpoint.
-
-    IMPORTANT CAVEAT (be upfront about this, don't just silently degrade): Twelve
-    Data's docs list some fundamentals fields as premium-plan-only, and the exact
-    free-tier field availability isn't confirmed without a live key — this
-    function is written defensively (every field access is a best-effort .get()
-    with a fallback to None) so a partially-populated or fully-missing response
-    degrades to "field unavailable" in the UI rather than crashing. If your key
-    returns a different shape than expected, the raw response is worth
-    inspecting directly (`curl` the endpoint) rather than assuming this parser
-    is exhaustive — it was built without the ability to test against a live key.
-
-    Returns None (not an exception) if the endpoint is unreachable, requires a
-    higher plan, or the key isn't configured — fundamentals are an enrichment,
-    not something that should ever block the rest of the app.
+    Twelve Data's /statistics endpoint — kept as a FALLBACK only. Confirmed via
+    live testing (2026-09-03) that the free tier restricts this endpoint to
+    their public demo symbol (AAPL); every other ticker 403s regardless of
+    retry/pacing. Finnhub (tried first in `fetch_fundamentals` below) covers
+    every ticker on its free tier, so this mostly matters if FINNHUB_API_KEY
+    isn't configured, or specifically for AAPL where Twelve Data happens to work.
     """
     if not LLM_SETTINGS.twelvedata_api_key:
         return None
@@ -365,13 +392,6 @@ def fetch_fundamentals(ticker: str) -> dict | None:
     if payload.get("status") == "error" or "code" in payload and "message" in payload:
         message = payload.get("message", str(payload))
         if payload.get("code") == 403:
-            # Confirmed via live testing (2026-09-03): Twelve Data's free tier only
-            # grants /statistics access on their public demo symbol (AAPL) — every
-            # other ticker returns this 403, regardless of retry or pacing. This is
-            # a plan restriction, not a transient failure, so it's raised distinctly
-            # rather than folded into the generic "return None" path — the caller
-            # should tell the user WHY, not just show a blank dash that looks like
-            # a bug.
             raise TwelveDataPlanRestricted(message)
         logger.warning("Twelve Data fundamentals unavailable for %s: %s", ticker, message)
         return None
@@ -383,6 +403,7 @@ def fetch_fundamentals(ticker: str) -> dict | None:
 
     result = {
         "name": (payload.get("meta") or {}).get("name"),
+        "source": "Twelve Data",
         "market_cap": valuations.get("market_capitalization"),
         "pe_ratio": valuations.get("trailing_pe"),
         "forward_pe": valuations.get("forward_pe"),
@@ -393,5 +414,87 @@ def fetch_fundamentals(ticker: str) -> dict | None:
         "52w_high": stock_stats.get("52_week_high"),
         "52w_low": stock_stats.get("52_week_low"),
     }
-    # Not worth returning a dict of all-None values — treat as unavailable.
-    return result if any(v is not None for k, v in result.items() if k != "name") else None
+    return result if any(v is not None for k, v in result.items() if k not in ("name", "source")) else None
+
+
+FINNHUB_PROFILE_URL = "https://finnhub.io/api/v1/stock/profile2"
+FINNHUB_METRIC_URL = "https://finnhub.io/api/v1/stock/metric"
+
+
+def _fetch_finnhub_fundamentals(ticker: str) -> dict | None:
+    """
+    Fundamentals via Finnhub's `/stock/profile2` (company profile) and
+    `/stock/metric` (valuation/risk ratios) — PRIMARY source, tried before
+    Twelve Data. Unlike Twelve Data's /statistics, these two endpoints are
+    confirmed free-tier for arbitrary tickers (not restricted to a demo
+    symbol) per Finnhub's own free-tier feature list and multiple independent
+    working code examples — verified via web search, not a live key in this
+    environment, so if field names have drifted, `curl` both endpoints
+    directly before assuming this parser is stale.
+
+    Quirk worth knowing if debugging: Finnhub's `marketCapitalization` is
+    denominated in MILLIONS of the reporting currency, not raw units — this
+    function multiplies by 1e6 so the UI's `$X,XXX,XXX,XXX` formatting stays
+    consistent with the Twelve Data fallback's raw-unit convention.
+    """
+    if not LLM_SETTINGS.finnhub_api_key:
+        return None
+
+    try:
+        profile_resp = requests.get(
+            FINNHUB_PROFILE_URL, params={"symbol": ticker, "token": LLM_SETTINGS.finnhub_api_key}, timeout=10,
+        )
+        metric_resp = requests.get(
+            FINNHUB_METRIC_URL, params={"symbol": ticker, "metric": "all", "token": LLM_SETTINGS.finnhub_api_key}, timeout=10,
+        )
+        profile_resp.raise_for_status()
+        metric_resp.raise_for_status()
+        profile = profile_resp.json()
+        metric = (metric_resp.json() or {}).get("metric", {}) or {}
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning("Finnhub fundamentals request failed for %s: %s", ticker, exc)
+        return None
+
+    if not profile and not metric:
+        return None  # Finnhub returns {} (not an error field) for an unrecognised symbol
+
+    market_cap_millions = profile.get("marketCapitalization")
+    result = {
+        "name": profile.get("name"),
+        "source": "Finnhub",
+        "market_cap": market_cap_millions * 1_000_000 if market_cap_millions else None,
+        "pe_ratio": metric.get("peBasicExclExtraTTM") or metric.get("peTTM"),
+        "forward_pe": metric.get("peForward"),  # often absent on free tier — stays None, shows as "—"
+        "peg_ratio": metric.get("pegRatio"),
+        "price_to_book": metric.get("pbQuarterly") or metric.get("pbAnnual"),
+        "beta": metric.get("beta"),
+        "dividend_yield": (
+            (metric.get("dividendYieldIndicatedAnnual") or metric.get("currentDividendYieldTTM")) / 100
+            if (metric.get("dividendYieldIndicatedAnnual") or metric.get("currentDividendYieldTTM"))
+            else None
+        ),  # Finnhub returns yield as a percentage number (e.g. 0.44 for 0.44%), our UI expects
+        # a decimal fraction (0.0044) since it formats with :.2% — divide by 100 to match.
+        "52w_high": metric.get("52WeekHigh"),
+        "52w_low": metric.get("52WeekLow"),
+    }
+    return result if any(v is not None for k, v in result.items() if k not in ("name", "source")) else None
+
+
+@st.cache_data(show_spinner=False, ttl=6 * 3600)
+def fetch_fundamentals(ticker: str) -> dict | None:
+    """
+    Per-ticker fundamentals (P/E, market cap, dividend yield, beta, 52w range).
+    Tries Finnhub first (free tier covers arbitrary tickers), falls back to
+    Twelve Data only if Finnhub isn't configured or returns nothing — Twelve
+    Data's free tier is confirmed restricted to their demo symbol (AAPL) for
+    this data, so it's a fallback, not the primary path, as of 2026-09-03.
+
+    Returns None (not an exception) if both sources fail or neither key is
+    configured — fundamentals are an enrichment, not something that should
+    ever block the rest of the app. May still raise TwelveDataPlanRestricted
+    from the Twelve Data fallback — callers already handle that distinctly.
+    """
+    result = _fetch_finnhub_fundamentals(ticker)
+    if result is not None:
+        return result
+    return _fetch_twelvedata_fundamentals(ticker)

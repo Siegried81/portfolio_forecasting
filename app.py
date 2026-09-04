@@ -18,6 +18,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 import time
+from urllib.parse import quote as _url_quote
 
 import numpy as np
 import pandas as pd
@@ -30,16 +31,21 @@ from src.backtesting import forecast_win_rate, generate_expanding_windows, run_w
 from src.config import (
     ALL_KNOWN_TICKERS,
     BENCHMARK_TICKER,
+    COV_METHOD_LEDOIT_WOLF,
+    COV_METHOD_PCA,
     DEFAULT_EQUITY_TICKERS,
     DEFAULT_FORECAST_HORIZON_DAYS,
     DEFAULT_MAX_WEIGHT_PER_ASSET,
+    DEFAULT_PCA_FACTORS,
     DEFAULT_RISK_FREE_RATE,
     DEFAULT_TRANSACTION_COST_BPS,
     DEFAULT_WALK_FORWARD_WINDOWS,
     FREQUENCY_TO_PERIODS_PER_YEAR,
     LLM_SETTINGS,
+    MAX_PCA_FACTORS,
     MAX_WALK_FORWARD_WINDOWS,
     MEGA_CAP_TICKERS,
+    MIN_PCA_FACTORS,
     MIN_WALK_FORWARD_WINDOWS,
     QUICK_DATE_RANGES,
     SP500_SECTOR_UNIVERSE,
@@ -57,7 +63,10 @@ from src.market_data import (
     resample_prices,
 )
 from src.metrics import apply_transaction_cost, compute_returns, compute_turnover, portfolio_returns, summarise_performance
+from src.timeseries_diagnostics import adf_stationarity_test, hurst_exponent, rolling_sharpe
 from src.optimization import (
+    concentration_hhi,
+    diversification_ratio,
     efficient_frontier_points,
     forecast_mu,
     historical_mu_cov,
@@ -67,6 +76,82 @@ from src.optimization import (
 )
 
 st.set_page_config(page_title="Portfolio Forecasting & Optimization", layout="wide", page_icon="📈")
+
+# ----------------------------------------------------------------------------------
+# Background — added 2026-09-04, REWRITTEN 2026-09-05 after the first version was too
+# faint to read and didn't cover the sidebar. The SVG is kept here as a real, readable
+# multi-line string (encoded to a data-URI at RUNTIME via urllib.parse.quote) instead
+# of a pre-encoded one-line blob — if you want to tweak the look, edit the numbers in
+# _BACKGROUND_SVG directly below; every opacity/stroke-width/color is a plain, labelled
+# value on its own line, not buried in a URL-encoded string.
+#
+# Reuses the SAME navy (#0E4C92) already used for the efficient-frontier line
+# elsewhere in this file — one visual identity, not a decoration bolted on separately.
+_BACKGROUND_SVG = """
+<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 1600 900' preserveAspectRatio='xMidYMid slice'>
+  <g stroke='#0E4C92' stroke-width='1.5' opacity='0.12'>
+    <line x1='0' y1='100' x2='1600' y2='100'/>
+    <line x1='0' y1='250' x2='1600' y2='250'/>
+    <line x1='0' y1='400' x2='1600' y2='400'/>
+    <line x1='0' y1='550' x2='1600' y2='550'/>
+    <line x1='0' y1='700' x2='1600' y2='700'/>
+    <line x1='0' y1='850' x2='1600' y2='850'/>
+    <line x1='200' y1='0' x2='200' y2='900'/>
+    <line x1='450' y1='0' x2='450' y2='900'/>
+    <line x1='700' y1='0' x2='700' y2='900'/>
+    <line x1='950' y1='0' x2='950' y2='900'/>
+    <line x1='1200' y1='0' x2='1200' y2='900'/>
+    <line x1='1450' y1='0' x2='1450' y2='900'/>
+  </g>
+  <path d='M0,620 L80,590 L160,640 L240,560 L320,610 L400,480 L480,520 L560,430 L640,470
+           L720,380 L800,420 L880,340 L960,390 L1040,300 L1120,350 L1200,260
+           L1280,300 L1360,220 L1440,270 L1520,190 L1600,230'
+        fill='none' stroke='#0E4C92' stroke-width='2.5' opacity='0.20'/>
+  <path d='M0,700 L80,720 L160,690 L240,730 L320,680 L400,710 L480,650 L560,690
+           L640,630 L720,660 L800,600 L880,640 L960,590 L1040,610 L1120,560
+           L1200,600 L1280,550 L1360,580 L1440,530 L1520,560 L1600,520'
+        fill='none' stroke='#0E4C92' stroke-width='2.5' opacity='0.12'/>
+</svg>
+"""
+
+_background_data_uri = "data:image/svg+xml," + _url_quote(
+    " ".join(line.strip() for line in _BACKGROUND_SVG.splitlines())
+)
+
+st.markdown(
+    f"""
+    <style>
+    /* Page + sidebar background — BOTH containers, not just the main area:
+       the sidebar has its own opaque background in Streamlit by default and
+       was silently hiding the pattern entirely before this fix. */
+    .stApp, [data-testid="stAppViewContainer"], [data-testid="stSidebar"] {{
+        background-color: #E9EDF5;
+        background-image: url("{_background_data_uri}");
+        background-size: cover;
+        background-position: center;
+        background-repeat: no-repeat;
+        background-attachment: fixed;
+    }}
+    [data-testid="stHeader"] {{
+        background-color: rgba(0, 0, 0, 0);
+    }}
+    /* Input fields — text inputs, text areas, chat input, number inputs, and
+       select/multiselect boxes now get an explicit white fill + visible
+       border, so they read as fields instead of blending into the new
+       background color above. */
+    .stTextInput input, .stTextArea textarea, .stChatInput textarea, .stNumberInput input {{
+        background-color: #FFFFFF !important;
+        border: 1px solid #C7CEDA !important;
+        border-radius: 6px !important;
+    }}
+    [data-baseweb="select"] > div {{
+        background-color: #FFFFFF !important;
+        border: 1px solid #C7CEDA !important;
+    }}
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 
 # ----------------------------------------------------------------------------------
@@ -86,7 +171,7 @@ def render_sidebar() -> dict:
         # sector multiselect below is what drives it instead.
 
     st.sidebar.selectbox(
-        "Universe preset", options=["Brief default (5)", "Mega Caps (15)", "Custom / sector picker"],
+        "Universe preset", options=["By default (5)", "Mega Caps (15)", "Custom / sector picker"],
         key="universe_preset_select", on_change=_apply_universe_preset,
         help="Presets replace your current asset selection. Pick 'Custom / sector picker' to "
              "build a universe from GICS sectors instead.",
@@ -104,12 +189,42 @@ def render_sidebar() -> dict:
         if sector_tickers and st.sidebar.button("Apply sector selection to Assets"):
             st.session_state["assets_select"] = sorted(set(sector_tickers))
 
+    def _apply_custom_tickers() -> None:
+        """Sync newly-typed custom tickers into the Assets multiselect's OWN
+        session_state ("assets_select") — added 2026-09 because typing a
+        ticker here already fed the app's calculations correctly, but never
+        appeared as a selected pill in the multiselect above, which reads as
+        broken even though it wasn't. Only tickers already in
+        ALL_KNOWN_TICKERS can become a pill (the multiselect's `options` list
+        is fixed, Streamlit can't display a pill for an option outside it) —
+        a genuinely unknown symbol still works for computation via the
+        text-based merge below, it just won't show as a pill here. Runs
+        BEFORE the script reruns (Streamlit's on_change contract), so by the
+        time the multiselect widget below actually renders, this update is
+        already in session_state.
+        """
+        custom_text = st.session_state.get("custom_tickers_input", "")
+        if not custom_text.strip():
+            return
+        typed = [t.strip().upper() for t in custom_text.split(",") if t.strip()]
+        known_new = [t for t in typed if t in ALL_KNOWN_TICKERS]
+        if known_new:
+            current = st.session_state.get("assets_select", [])
+            st.session_state["assets_select"] = list(dict.fromkeys(current + known_new))
+
     tickers = st.sidebar.multiselect(
         "Assets", options=ALL_KNOWN_TICKERS, default=DEFAULT_EQUITY_TICKERS, key="assets_select",
         help="Equities, sector picks, ETFs, commodities and FX proxies — all in one list. "
              "Add custom tickers below if you don't see what you're after.",
     )
-    custom = st.sidebar.text_input("Add custom tickers (comma-separated)", value="")
+    custom = st.sidebar.text_input(
+        "Add custom tickers (comma-separated)", value="", key="custom_tickers_input",
+        on_change=_apply_custom_tickers,
+        help="Recognised tickers (already in this app's universe) are added as pills above "
+             "automatically. Unrecognised symbols still work for the calculations below, they "
+             "just won't show as a pill — this app has no way to validate an arbitrary symbol "
+             "without a network call, so it's trusted as typed.",
+    )
     if custom.strip():
         tickers = list(dict.fromkeys(tickers + [t.strip().upper() for t in custom.split(",") if t.strip()]))
 
@@ -185,11 +300,33 @@ def render_sidebar() -> dict:
              "(or unlucky) outcome. ARIMA is noticeably slower here than ETS/naive.",
     )
 
+    st.sidebar.divider()
+    cov_method_label = st.sidebar.selectbox(
+        "Covariance estimator", options=["Ledoit-Wolf shrinkage", "PCA factor model"],
+        help="Ledoit-Wolf (default) is a solid fix for a small universe's noisy sample "
+             "covariance. Once your universe gets wide (~40+ assets) relative to the history "
+             "available, a PCA statistical factor model is the tractable alternative — same "
+             "core idea real buy-side desks use (Barra, APT) for exactly this problem. Applied "
+             "consistently everywhere a covariance is estimated (frontier, comparison, "
+             "walk-forward), not just here.",
+    )
+    cov_method = COV_METHOD_PCA if cov_method_label == "PCA factor model" else COV_METHOD_LEDOIT_WOLF
+    n_factors = DEFAULT_PCA_FACTORS
+    if cov_method == COV_METHOD_PCA:
+        n_factors = st.sidebar.slider(
+            "Number of factors", min_value=MIN_PCA_FACTORS, max_value=MAX_PCA_FACTORS, value=DEFAULT_PCA_FACTORS,
+            help="More factors capture more of the universe's variance but bring the parameter "
+                 "count back up toward the problem this is meant to solve — the Efficient "
+                 "Frontier tab shows cumulative explained variance so you can judge whether this "
+                 "count is actually enough for your selected universe.",
+        )
+
     return dict(
         tickers=tickers, start_date=start_date, end_date=end_date, frequency=frequency,
         risk_free_rate=risk_free_rate, forecast_horizon=forecast_horizon, forecast_model=forecast_model,
         walk_forward_windows=walk_forward_windows, max_weight_per_asset=max_weight_per_asset,
         allow_short_selling=allow_short_selling, transaction_cost_bps=transaction_cost_bps,
+        cov_method=cov_method, n_factors=n_factors,
     )
 
 
@@ -238,6 +375,48 @@ def render_macro_panel() -> dict:
     else:
         col4.metric("VIX (fear gauge)", "n/a")
 
+    # Second row, added 2026-09-04: the rest of the Fed's dual mandate
+    # (inflation + unemployment), the actual policy rate, and a credit-risk
+    # signal — the yield curve and VIX alone miss all four of these.
+    col5, col6, col7, col8 = st.columns(4)
+    cpi = macro["cpi_yoy_inflation"]
+    col5.metric("CPI YoY (inflation)", f"{cpi:.1%}" if cpi is not None else "n/a")
+    unemployment = macro["unemployment_rate"]
+    col6.metric("Unemployment rate", f"{unemployment:.1%}" if unemployment is not None else "n/a")
+    fed_funds = macro["fed_funds_rate"]
+    col7.metric("Fed funds rate (effective)", f"{fed_funds:.2%}" if fed_funds is not None else "n/a")
+    credit_spread = macro["credit_spread_baa10y"]
+    col8.metric("Baa credit spread (vs 10Y)", f"{credit_spread:.2%}" if credit_spread is not None else "n/a")
+
+    col9, col10 = st.columns(2)
+    gdp_growth = macro["gdp_growth_qoq_annualized"]
+    col9.metric(
+        "GDP growth (QoQ, annualized)", f"{gdp_growth:+.1%}" if gdp_growth is not None else "n/a",
+        help="Real GDP % change, quarterly, seasonally adjusted annual rate (FRED). Updated quarterly, "
+             "so this changes far less often than the daily/monthly series above.",
+    )
+    indpro = macro["industrial_production_yoy"]
+    col10.metric(
+        "Industrial production (YoY)", f"{indpro:+.1%}" if indpro is not None else "n/a",
+        help="Proxy for ISM Manufacturing PMI: ISM's own PMI is a paid, proprietary survey-based "
+             "series not available on FRED or any free API. Industrial Production is the closest "
+             "free substitute — real output data rather than a survey diffusion index, but it "
+             "captures the same underlying signal (manufacturing-sector momentum).",
+    )
+
+    sahm = macro["sahm_rule_indicator"]
+    if sahm is not None:
+        st.metric(
+            "Sahm Rule recession indicator", f"{sahm:.2f}",
+            delta="≥0.50 — historically marks a recession's start" if sahm >= 0.50 else "Below the 0.50 threshold",
+            delta_color="inverse",
+        )
+        st.caption(
+            "Sahm Rule: the 3-month average unemployment rate rising 0.50 points above its low of "
+            "the prior 12 months. Every reading ≥0.50 has coincided with the start of a US "
+            "recession since 1970, with no false positives to date (Claudia Sahm / FRED)."
+        )
+
     if macro["three_month_yield"] is None or macro["ten_year_yield"] is None:
         st.caption("Set FRED_API_KEY in .env for live Treasury yields — see README.")
         with st.expander("Debug: what this app process actually sees"):
@@ -252,6 +431,18 @@ def render_macro_panel() -> dict:
         "The 10Y-3M spread turning negative has preceded every US recession since the 1960s "
         "(with some false positives) — shown here as context, not a trading signal in itself."
     )
+    with st.expander("Sources (FRED series)"):
+        st.markdown(
+            "- [3M T-bill (DGS3MO)](https://fred.stlouisfed.org/series/DGS3MO)\n"
+            "- [10Y Treasury (DGS10)](https://fred.stlouisfed.org/series/DGS10)\n"
+            "- [CPI, all urban consumers (CPIAUCSL)](https://fred.stlouisfed.org/series/CPIAUCSL)\n"
+            "- [Unemployment rate (UNRATE)](https://fred.stlouisfed.org/series/UNRATE)\n"
+            "- [Effective Fed funds rate, daily (DFF)](https://fred.stlouisfed.org/series/DFF)\n"
+            "- [Sahm Rule recession indicator (SAHMREALTIME)](https://fred.stlouisfed.org/series/SAHMREALTIME)\n"
+            "- [Baa corporate bond yield vs 10Y (BAA10Y)](https://fred.stlouisfed.org/series/BAA10Y)\n"
+            "- [Real GDP growth (A191RL1Q225SBEA)](https://fred.stlouisfed.org/series/A191RL1Q225SBEA)\n"
+            "- [Industrial Production Index — ISM PMI proxy (INDPRO)](https://fred.stlouisfed.org/series/INDPRO)"
+        )
 
     return {"macro": macro, "vix_level": vix_level}
 
@@ -295,7 +486,11 @@ def render_overview_tab(prices: pd.DataFrame, tickers: list[str], periods_per_ye
                 "Calmar": f"{m['calmar_ratio']:.2f}" if not pd.isna(m['calmar_ratio']) else "—",
                 "Omega": f"{m['omega_ratio']:.2f}" if not pd.isna(m['omega_ratio']) else "—",
                 "Beta (vs SPY)": f"{m.get('beta', float('nan')):.2f}" if 'beta' in m and not pd.isna(m['beta']) else "—",
+                "Alpha (Jensen, ann.)": f"{m['jensens_alpha']:+.2%}" if 'jensens_alpha' in m and not pd.isna(m['jensens_alpha']) else "—",
                 "Max drawdown": f"{m['max_drawdown']:.1%}",
+                "Ulcer Index": f"{m['ulcer_index']:.2f}" if not pd.isna(m['ulcer_index']) else "—",
+                "Skew": f"{m['skewness']:.2f}" if not pd.isna(m['skewness']) else "—",
+                "Kurtosis": f"{m['kurtosis']:.2f}" if not pd.isna(m['kurtosis']) else "—",
             })
         st.dataframe(pd.DataFrame(rows).set_index("Ticker"), width='stretch')
 
@@ -313,6 +508,60 @@ def render_overview_tab(prices: pd.DataFrame, tickers: list[str], periods_per_ye
             "portfolio-level risk below the average of the individual assets' risk — "
             "this matrix is the reason diversification works, not just a decorative chart."
         )
+
+    st.divider()
+    st.subheader("Time-series diagnostics")
+    st.caption(
+        "Structure of the series itself, not a performance summary — the kind of check an "
+        "economist does before trusting a forecast, not after. The ADF test directly validates "
+        "this app's own ARIMA `d=1` assumption (see forecasting.py); the Hurst exponent gives a "
+        "concrete, per-asset number for the efficient-market-hypothesis caveat stated throughout "
+        "this app's forecasting UI."
+    )
+    diag_rows = []
+    for ticker in tickers:
+        adf = adf_stationarity_test(returns[ticker])
+        h = hurst_exponent(prices[ticker])
+        if h > 0.55:
+            regime = "Trending"
+        elif h < 0.45:
+            regime = "Mean-reverting"
+        elif not np.isnan(h):
+            regime = "≈ Random walk"
+        else:
+            regime = "—"
+        diag_rows.append({
+            "Ticker": ticker,
+            "ADF p-value": f"{adf['p_value']:.3f}" if adf["p_value"] is not None else "—",
+            "Returns stationary?": (
+                "Yes" if adf["is_stationary"] is True else "No" if adf["is_stationary"] is False else "—"
+            ),
+            "Hurst exponent": f"{h:.2f}" if not np.isnan(h) else "—",
+            "Regime": regime,
+        })
+    st.dataframe(pd.DataFrame(diag_rows).set_index("Ticker"), width='stretch')
+    st.caption(
+        "ADF: 'Yes' (p < 0.05) means the return series itself shows no unit root — the standard, "
+        "expected result for returns (as opposed to price LEVELS, which are non-stationary by "
+        "construction, which is exactly why ARIMA differences them). Hurst: >0.55 trending "
+        "(momentum), <0.45 mean-reverting, ≈0.5 a random walk — most liquid equities sit close to "
+        "0.5, consistent with weak short-horizon predictability."
+    )
+
+    rolling_window = min(60, max(10, len(returns) // 4))
+    fig_rolling = go.Figure()
+    for ticker in tickers:
+        rs = rolling_sharpe(returns[ticker], window=rolling_window, periods_per_year=periods_per_year)
+        fig_rolling.add_trace(go.Scatter(x=rs.index, y=rs.values, name=ticker, mode="lines"))
+    fig_rolling.update_layout(
+        title=f"Rolling {rolling_window}-period Sharpe ratio",
+        yaxis_title="Rolling Sharpe", height=360,
+    )
+    st.plotly_chart(fig_rolling, width='stretch')
+    st.caption(
+        "A single end-of-sample Sharpe can hide a regime change (calm-then-crisis, or the "
+        "reverse) — this shows how risk-adjusted return actually evolved period to period."
+    )
 
     st.divider()
     st.subheader("Fundamentals")
@@ -359,6 +608,7 @@ def render_overview_tab(prices: pd.DataFrame, tickers: list[str], periods_per_ye
                     f"${f['52w_low']:.0f} – ${f['52w_high']:.0f}"
                     if f and f.get("52w_low") and f.get("52w_high") else "—"
                 ),
+                "Source": (f or {}).get("source") or "—",
             })
         progress.empty()
         st.dataframe(pd.DataFrame(rows).set_index("Ticker"), width='stretch')
@@ -380,10 +630,30 @@ def render_overview_tab(prices: pd.DataFrame, tickers: list[str], periods_per_ye
 
 def render_frontier_tab(
     prices: pd.DataFrame, tickers: list[str], risk_free_rate: float, periods_per_year: int, max_weight_per_asset: float,
-    allow_short_selling: bool,
+    allow_short_selling: bool, cov_method: str = COV_METHOD_LEDOIT_WOLF, n_factors: int = DEFAULT_PCA_FACTORS,
 ) -> pd.Series:
     st.subheader("Mean-variance efficient frontier (historical)")
-    mu, cov = historical_mu_cov(prices[tickers], periods_per_year)
+    mu, cov = historical_mu_cov(prices[tickers], periods_per_year, cov_method=cov_method, n_factors=n_factors)
+    if cov_method == COV_METHOD_PCA:
+        # Recomputed here (cheap — milliseconds) purely for its diagnostics;
+        # historical_mu_cov() itself keeps a clean 2-value (mu, cov) return
+        # contract every other call site already relies on.
+        from src.factor_models import pca_factor_cov
+        _, pca_diagnostics = pca_factor_cov(
+            compute_returns(prices[tickers]), n_factors=n_factors, periods_per_year=periods_per_year,
+        )
+        cumulative = pca_diagnostics["cumulative_explained"]
+        used = pca_diagnostics["n_factors_used"]
+        st.caption(
+            f"PCA factor model: {used} factor(s) explain **{cumulative:.0%}** of this universe's "
+            f"variance. " + (
+                "Below 50% means most of the risk here is idiosyncratic, not systematic — this "
+                "covariance estimate is weaker than it looks; consider more factors or fewer assets."
+                if cumulative < 0.5 else
+                "A reasonable capture — the systematic risk this covariance is built from represents "
+                "most of what actually moves this universe."
+            )
+        )
     weight_bounds = resolve_weight_bounds(max_weight_per_asset, allow_short_selling)
     weights = optimize_max_sharpe(mu, cov, risk_free_rate=risk_free_rate, weight_bounds=weight_bounds)
     perf = portfolio_performance(mu, cov, weights, risk_free_rate)
@@ -414,6 +684,20 @@ def render_frontier_tab(
         st.metric("Expected annual return", f"{perf['expected_return']:.1%}")
         st.metric("Expected annual volatility", f"{perf['expected_volatility']:.1%}")
         st.metric("Expected Sharpe ratio", f"{perf['expected_sharpe']:.2f}")
+        div_ratio = diversification_ratio(weights, cov)
+        st.metric(
+            "Diversification ratio", f"{div_ratio:.2f}" if not pd.isna(div_ratio) else "n/a",
+            help="Weighted-average individual asset volatility ÷ actual portfolio volatility. "
+                 ">1 means diversification is genuinely reducing risk below what the assets' own "
+                 "volatilities alone would suggest; =1 means none is being captured.",
+        )
+        hhi = concentration_hhi(weights)
+        st.metric(
+            "Concentration (HHI)", f"{hhi:.2f}",
+            help=f"Sum of squared weights. 1/{len(weights)} ≈ {1 / len(weights):.2f} would be "
+                 "perfectly equal-weighted; 1.0 would be a single asset. A quick check that the "
+                 "max-weight cap is doing its job.",
+        )
         st.write("**Optimal weights (max Sharpe):**")
         weights_display = weights[weights > 0.001].sort_values(ascending=False)
         st.dataframe(weights_display.map(lambda w: f"{w:.1%}").rename("Weight"), width='stretch')
@@ -465,7 +749,9 @@ def render_forecast_compare_tab(
     weight_bounds = resolve_weight_bounds(config["max_weight_per_asset"], config["allow_short_selling"])
 
     # --- 1. Historical-optimal (trained on train_prices only) ---
-    mu_hist, cov_hist = historical_mu_cov(train_prices[tickers], periods_per_year)
+    mu_hist, cov_hist = historical_mu_cov(
+        train_prices[tickers], periods_per_year, cov_method=config["cov_method"], n_factors=config["n_factors"],
+    )
     w_historical = optimize_max_sharpe(mu_hist, cov_hist, rf, weight_bounds)
 
     # --- 2. Forecast-optimal (mu from the forecast, cov still historical) ---
@@ -473,7 +759,9 @@ def render_forecast_compare_tab(
     w_forecast = optimize_max_sharpe(mu_fcst, cov_hist, rf, weight_bounds)
 
     # --- 3. Realized-optimal (hindsight: fitted on the actual held-out returns) ---
-    mu_real, cov_real = historical_mu_cov(test_prices[tickers], periods_per_year)
+    mu_real, cov_real = historical_mu_cov(
+        test_prices[tickers], periods_per_year, cov_method=config["cov_method"], n_factors=config["n_factors"],
+    )
     w_realized = optimize_max_sharpe(mu_real, cov_real, rf, weight_bounds)
 
     # Apply all three weight vectors to the SAME actual realized returns
@@ -501,7 +789,10 @@ def render_forecast_compare_tab(
     for col in ["period_return", "annual_return", "annual_volatility", "max_drawdown", "var_95", "cvar_95"]:
         if col in display_df.columns:
             display_df[col] = display_df[col].map(lambda x: f"{x:.1%}")
-    for col in ["sharpe_ratio", "sortino_ratio", "calmar_ratio", "omega_ratio", "beta", "information_ratio", "treynor_ratio"]:
+    if "jensens_alpha" in display_df.columns:
+        display_df["jensens_alpha"] = display_df["jensens_alpha"].map(lambda x: f"{x:+.2%}" if not pd.isna(x) else "—")
+    for col in ["sharpe_ratio", "sortino_ratio", "calmar_ratio", "omega_ratio", "beta", "information_ratio",
+                "treynor_ratio", "ulcer_index", "skewness", "kurtosis"]:
         if col in display_df.columns:
             display_df[col] = display_df[col].map(lambda x: f"{x:.2f}" if not pd.isna(x) and np.isfinite(x) else "—")
     display_df = display_df.drop(columns=["n_periods"], errors="ignore")
@@ -511,6 +802,8 @@ def render_forecast_compare_tab(
         "sortino_ratio": "Sortino", "calmar_ratio": "Calmar", "omega_ratio": "Omega",
         "max_drawdown": "Max DD", "var_95": "VaR 95%", "cvar_95": "CVaR 95%",
         "beta": "Beta (vs SPY)", "information_ratio": "Info. Ratio", "treynor_ratio": "Treynor",
+        "jensens_alpha": "Alpha (Jensen)", "ulcer_index": "Ulcer Index",
+        "skewness": "Skew", "kurtosis": "Kurtosis",
     })
     st.dataframe(display_df, width='stretch')
     st.caption(
@@ -590,6 +883,7 @@ def render_walk_forward_section(prices: pd.DataFrame, tickers: list[str], config
             prices, tickers, horizon, n_windows, config["forecast_model"],
             config["risk_free_rate"], periods_per_year, WALK_FORWARD_MIN_TRAIN_PERIODS,
             config["max_weight_per_asset"], config["allow_short_selling"], config["transaction_cost_bps"],
+            config["cov_method"], config["n_factors"],
         )
 
     fig = go.Figure()
@@ -658,12 +952,27 @@ def render_ai_analyst_tab(
                     "AMZN": "Amazon", "GOOG": "Google", "SPY": "S&P 500",
                     "QQQ": "Nasdaq", "TLT": "Treasury bonds", "GLD": "Gold", "VNQ": "REIT real estate",
                 }
-                digest, backend, articles = generate_news_digest(tickers, company_names)
-                st.session_state["news"] = (digest, backend, articles)
+                digest, backend, articles, sentiment_by_ticker = generate_news_digest(tickers, company_names)
+                st.session_state["news"] = (digest, backend, articles, sentiment_by_ticker)
                 st.session_state["news_chunks"] = build_chunks(articles)
         if "news" in st.session_state:
-            digest, backend, articles = st.session_state["news"]
+            digest, backend, articles, sentiment_by_ticker = st.session_state["news"]
             st.write(digest)
+
+            st.markdown("**Sentiment by ticker**")
+            for ticker, s in sentiment_by_ticker.items():
+                if s is None:
+                    st.caption(f"{ticker}: sentiment not available (no headlines fetched, or no source configured).")
+                    continue
+                score = s["score"]
+                if score > 0.1:
+                    label = "🟢 Bullish"
+                elif score < -0.1:
+                    label = "🔴 Bearish"
+                else:
+                    label = "⚪ Neutral"
+                st.caption(f"{ticker}: {label} (score {score:+.2f}, n={s['n_articles']}) — source: {s['provider']}")
+
             if articles:
                 provider_counts = pd.Series([a["provider"] for a in articles]).value_counts()
                 breakdown = ", ".join(f"{n} {p}" for p, n in provider_counts.items())
@@ -672,8 +981,19 @@ def render_ai_analyst_tab(
                     for a in articles:
                         st.markdown(f"- [{a['provider']}] [{a['title']}]({a['url']}) — *{a['source']}* ({a['ticker']})")
 
-    st.divider()
-    st.markdown("**Ask about your results**")
+
+def render_chatbot_tab() -> None:
+    """
+    Grounded Q&A, split into its own tab (rather than tacked onto the bottom of
+    AI Analyst) — a chat interface deserves its own space rather than competing
+    for attention below two other panels. Reads `results_context`/`news_chunks`
+    from session_state, set by render_ai_analyst_tab on this run — if the user
+    hasn't visited AI Analyst yet this run, results_context still exists (set
+    once per run in render_ai_analyst_tab, called before this tab renders in
+    `main()`'s tab order), so the chat is always grounded correctly regardless
+    of which tab the user looks at first.
+    """
+    st.subheader("Ask about your results")
     st.caption("Grounded in the numbers computed above — won't invent figures that aren't there.")
 
     if "chat_history" not in st.session_state:
@@ -692,7 +1012,7 @@ def render_ai_analyst_tab(
             with st.spinner("Thinking..."):
                 try:
                     answer, backend = answer_portfolio_question(
-                        question, st.session_state["results_context"], st.session_state["chat_history"][:-1],
+                        question, st.session_state.get("results_context", ""), st.session_state["chat_history"][:-1],
                         st.session_state.get("news_chunks"),
                     )
                     st.write(answer)
@@ -722,19 +1042,27 @@ def main() -> None:
         return
 
     periods_per_year = FREQUENCY_TO_PERIODS_PER_YEAR[config["frequency"]]
-    tab_overview, tab_frontier, tab_compare, tab_ai = st.tabs(
-        ["Overview", "Efficient Frontier", "Forecast & Compare", "AI Analyst"]
+    tab_overview, tab_frontier, tab_compare, tab_ai, tab_chat = st.tabs(
+        ["Overview", "Efficient Frontier", "Forecast & Compare", "AI Analyst", "Chatbot"]
     )
 
     with tab_overview:
-        macro_context = render_macro_panel()
-        st.divider()
-        render_overview_tab(prices, config["tickers"], periods_per_year)
+        # Split into sub-tabs (2026-09-04): macro panel + price/correlation/
+        # diagnostics/fundamentals used to all stack vertically in one tab,
+        # requiring a lot of scrolling to see everything. Nested st.tabs()
+        # groups them logically instead — render_macro_panel() and
+        # render_overview_tab() are both unchanged internally, this only
+        # changes where their output lands.
+        sub_macro, sub_prices = st.tabs(["Macro & Risk", "Prices & Analytics"])
+        with sub_macro:
+            macro_context = render_macro_panel()
+        with sub_prices:
+            render_overview_tab(prices, config["tickers"], periods_per_year)
 
     with tab_frontier:
         weights = render_frontier_tab(
             prices, config["tickers"], config["risk_free_rate"], periods_per_year, config["max_weight_per_asset"],
-            config["allow_short_selling"],
+            config["allow_short_selling"], config["cov_method"], config["n_factors"],
         )
 
     with tab_compare:
@@ -746,6 +1074,12 @@ def main() -> None:
             st.info("Run the Forecast & Compare tab first (needs a valid date range/horizon) to unlock AI commentary.")
         else:
             render_ai_analyst_tab(weights, hist_m, fcst_m, real_m, config["tickers"], macro_context)
+
+    with tab_chat:
+        if hist_m is None:
+            st.info("Run the Forecast & Compare tab first (needs a valid date range/horizon) to unlock the chatbot.")
+        else:
+            render_chatbot_tab()
 
 
 if __name__ == "__main__":

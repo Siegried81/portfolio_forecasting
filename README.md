@@ -1,26 +1,26 @@
 # Portfolio Forecasting & Optimization
 
-Interactive Streamlit app that builds and compares three portfolios — **historical-based**,
-**forecast-based**, and **realized-optimal (hindsight)** — using mean-variance optimization,
-and adds an AI analyst layer (LLM commentary, news digest, grounded Q&A chatbot).
-
-Built as a technical case study (BeCode AI & Data Science bootcamp — GenAI Developer track).
+I built this as a technical case study for BeCode's AI & Data Science bootcamp (GenAI Developer
+track): an interactive Streamlit app that builds and compares three portfolios —
+**historical-based**, **forecast-based**, and **realized-optimal (hindsight)** — using
+mean-variance optimization, plus an AI analyst layer I added on top (LLM commentary, news digest,
+grounded Q&A chatbot).
 
 ## Live demo
-- Streamlit Community Cloud: _add URL after deploying_
-- Render (backup): _add URL after deploying_
+- Streamlit Community Cloud: [portfolio-forecasting-sieg.streamlit.app](https://portfolio-forecasting-sieg.streamlit.app/)
+- Render: [portfolio-forecasting.onrender.com](https://portfolio-forecasting.onrender.com)
 
-## What this does, in one paragraph
+## What it does, in one paragraph
 
-You pick a universe of stocks/ETFs, a date range, and a frequency. The app computes historical
-returns, volatility, correlation, and the max-Sharpe efficient-frontier portfolio. It then holds
-out the last N periods, forecasts each asset's price over that window (ARIMA / Exponential
-Smoothing / naive random walk — see "Why not Kats" below), builds an optimal portfolio from the
-*forecasted* returns, and compares its **actual, realized** out-of-sample performance against
-(a) the historical-based portfolio and (b) the hindsight-optimal portfolio built from the *actual*
-returns of that same window. An AI Analyst tab (Groq, with local Ollama fallback) narrates the
-results and answers questions about them, grounded in the computed numbers — plus a NewsAPI-based
-news digest per ticker.
+You pick a universe of stocks/ETFs, a date range, and a frequency. I compute historical returns,
+volatility, correlation, and the max-Sharpe efficient-frontier portfolio. Then I hold out the last
+N periods, forecast each asset's price over that window (ARIMA / Exponential Smoothing / naive
+random walk — see "Why not Kats" below), build an optimal portfolio from the *forecasted* returns,
+and compare its **actual, realized** out-of-sample performance against (a) the historical-based
+portfolio and (b) the hindsight-optimal portfolio built from the *actual* returns of that same
+window. An AI Analyst tab (Groq, with local Ollama fallback) narrates the results and answers
+questions about them, grounded in the computed numbers — plus a news digest per ticker
+cross-referencing NewsAPI, Finnhub, and SEC EDGAR filings.
 
 ## Contents
 
@@ -34,6 +34,8 @@ news digest per ticker.
 - [Deployment](#deployment)
 - [Sources (from the brief)](#sources-from-the-brief)
 - [Key challenges](#key-challenges)
+- [Known limitations](#known-limitations)
+- [Next steps](#next-steps)
 
 ## Understanding the KPIs — formulas & how to read them
 
@@ -68,6 +70,16 @@ depending on the sidebar), `rf` = risk-free rate, `n` = periods per year (252/52
   number that correlates most with an investor actually panic-selling — bigger drawdowns are
   harder to sit through than volatility alone suggests.
 - Where: every metrics table; also the input to Calmar (below).
+
+**Ulcer Index** (added 2026-09)
+- What it measures: like Max Drawdown, but captures *duration* underwater too, not just depth.
+- Formula: root-mean-square of the percentage drawdown at *every* point in the series (Peter
+  Martin, 1987), not just the single worst point.
+- How to read it: a portfolio stuck at -20% for a year and one that dips to -20% for a single week
+  and recovers share the identical Max Drawdown — but very different Ulcer Index values. Lower is
+  better; 0 means the wealth curve never dipped below a prior peak. No universal "good" threshold;
+  compare across the three portfolios the same way Calmar is compared.
+- Where: every metrics table.
 
 **VaR 95% (Value at Risk)**
 - What it measures: the loss threshold that historical returns crossed in the worst 5% of periods.
@@ -131,6 +143,20 @@ depending on the sidebar), `rf` = risk-free rate, `n` = periods per year (252/52
   sample — check the sample size before trusting that.
 - Where: every metrics table.
 
+**Skewness & Kurtosis** (added 2026-09)
+- What they measure: the return distribution's third and fourth standardised moments — the "skewed
+  or fat-tailed" language in Omega's own description above, made explicit and numeric instead of
+  implicit.
+- How to read Skewness: 0 = symmetric; negative = a longer/fatter *left* tail (occasional large
+  losses — the shape most equity return series actually have, and exactly the asymmetry
+  Sortino/Omega are built to catch that Sharpe's symmetric variance can't); positive = a
+  longer/fatter *right* tail.
+- How to read Kurtosis: pandas' excess-kurtosis convention — 0 = same tail thickness as a normal
+  distribution. Positive = fatter tails than normal (more extreme outcomes than a Gaussian model
+  would predict, the standard finding for equity returns and the reason VaR/CVaR above are
+  computed non-parametrically rather than assumed normal in the first place).
+- Where: every metrics table.
+
 ### 3. Benchmark-relative metrics — vs. SPY
 
 Computed only when a benchmark return series is available (SPY is always fetched in the
@@ -165,6 +191,18 @@ background regardless of your ticker selection specifically so these are always 
   market at all, versus genuine diversification or security selection.
 - Where: Forecast & Compare (per-portfolio).
 
+**Jensen's Alpha (CAPM alpha)**
+- What it measures: annualised return earned *above* what CAPM predicts given the portfolio's own
+  market exposure (beta) — added specifically because Beta and Treynor tell you how much market
+  risk was taken, but neither answers whether that risk-taking actually paid off beyond what beta
+  alone would predict.
+- Formula: `annualised_return − [rf + beta × (annualised_benchmark_return − rf)]`
+- How to read it: positive alpha = outperformed its own CAPM benchmark (genuine edge, or luck on a
+  single window — same caveat as everywhere else in this app); negative = underperformed what its
+  market exposure alone would predict, even if raw Sharpe/Sortino look fine in isolation. This is
+  the metric a CAPM-literate interviewer will ask for the moment Beta is on screen.
+- Where: Overview (per-asset), Forecast & Compare (per-portfolio).
+
 ### 4. Optimizer outputs — expected, not realized
 
 Shown in the **Efficient Frontier** tab. These come from the optimizer's own inputs (historical
@@ -175,6 +213,15 @@ see the gap between expectation and outcome.
 - **Expected annual return** = `w · μ` (weights dotted with the expected-return vector)
 - **Expected annual volatility** = `√(w · Σ · w)` (portfolio variance from the covariance matrix)
 - **Expected Sharpe** = `(expected_return − rf) / expected_volatility`
+- **Diversification ratio** (added 2026-09) = `(weighted-average individual asset volatility) /
+  (actual portfolio volatility)`. The correlation matrix in the Overview tab is visual — this is
+  the number version. >1 whenever correlations are below 1 everywhere (the normal case); the gap
+  between the two is precisely the risk reduction diversification bought. =1 for a single asset
+  or perfectly correlated assets, where diversification buys nothing.
+- **Concentration (HHI)** (added 2026-09) = `Σ w_i²`. Ranges from `1/N` (equal-weighted across N
+  assets) to 1.0 (a single asset). A quick check that the sidebar's max-weight cap is actually
+  doing its job — distinct from the diversification ratio above, which measures the risk benefit
+  realised, not the allocation shape itself.
 
 ### 5. Forecast validation
 
@@ -198,37 +245,108 @@ see the gap between expectation and outcome.
   signal.
 - **Risk-free rate** — live 3-month T-bill yield (FRED), used as `rf` in every ratio above that
   needs one (Sharpe, Sortino, Treynor). Overridable by hand in the sidebar.
+- **CPI inflation (YoY)**, **unemployment rate**, and **effective Fed funds rate** (all added
+  2026-09, FRED) — the rest of the Fed's dual mandate plus the actual policy rate, not just a
+  market-priced proxy for it. Missing these was a real gap: the yield curve and VIX alone don't
+  tell you what the Fed is actually targeting or where the policy rate currently sits.
+- **Sahm Rule recession indicator** (added 2026-09, FRED's `SAHMREALTIME`) — the 3-month average
+  unemployment rate rising 0.50 points above its low of the prior 12 months. Every reading ≥0.50
+  has coincided with the start of a US recession since 1970, with no false positives to date —
+  about as close to a single-number recession signal as macro data gets.
+- **Baa corporate credit spread vs 10Y Treasury** (added 2026-09, FRED's `BAA10Y`) — corporate
+  credit risk / risk appetite, a different stress channel from the government-yield curve or VIX
+  (widening means the market is pricing more corporate default/liquidity risk specifically).
+- **Real GDP growth** (added 2026-09, FRED's `A191RL1Q225SBEA`, quarterly, seasonally adjusted
+  annual rate) — the headline "GDP grew at X% annualized" figure. Updates far less often than
+  everything else on the panel (quarterly, not daily/monthly).
+- **Industrial Production (YoY), as an ISM Manufacturing PMI proxy** (added 2026-09, FRED's
+  `INDPRO`) — a substitution documented honestly, same spirit as the Kats/Riskfolio-Lib swaps in
+  "Key design decisions" below: ISM's own PMI is a paid, proprietary survey series, not available
+  on FRED or any free API. Industrial Production is the closest legitimate free alternative — real
+  output data rather than a survey diffusion index, but it captures the same underlying signal
+  (manufacturing-sector momentum).
+- Every FRED series above is linked from a "Sources" expander directly under the macro panel in
+  the app, same transparency pattern as the news digest's source links.
 
-### 7. Fundamentals (data points, not ratios)
+### 7. Time-series diagnostics (structure, not performance)
 
-Per-ticker, via Twelve Data (Overview tab, fetched on demand): market capitalization, trailing/
-forward P/E, beta (Twelve Data's own calculation — may differ slightly from the app's own
-`beta_vs_benchmark` above due to differing lookback windows/methodology), dividend yield, 52-week
-price range. See the fundamentals caveat further below (free-tier field availability).
+Shown in the **Overview** tab, per asset — these diagnose the series' own structure rather than
+summarising performance, the kind of check done *before* trusting a forecast rather than after.
+
+**ADF stationarity test** (Augmented Dickey-Fuller, on returns)
+- What it measures: whether the return series has a unit root (is non-stationary).
+- How to read it: directly validates `forecasting.py`'s own ARIMA `d=1` first-differencing choice
+  — ARIMA fixes `d=1` because price *levels* are non-stationary by construction; this test checks
+  whether the differenced series (returns) actually *is* stationary, instead of the codebase just
+  asserting it. "Yes" (p < 0.05) is the expected, textbook result for returns.
+
+**Hurst exponent** (on prices)
+- What it measures: persistence/self-similarity of the price series, via the variance-of-lagged-
+  differences method (a standard simplified estimator — not full rescaled-range analysis, a
+  documented trade-off, same spirit as TF-IDF vs. embeddings in `rag.py`).
+- How to read it: > 0.55 trending/momentum (a move tends to be followed by a move in the same
+  direction); < 0.45 mean-reverting (a move tends to reverse); ≈ 0.5 a random walk — the concrete,
+  per-asset number behind the efficient-market-hypothesis caveat stated throughout this app's
+  forecasting UI. Most liquid large-cap equities sit close to 0.5.
+
+**Rolling Sharpe ratio** (chart, window auto-sized to the sample length)
+- What it measures: risk-adjusted return computed on a moving window instead of the whole sample.
+- How to read it: a single end-of-sample Sharpe can hide a regime change (calm-then-crisis, or the
+  reverse) — the rolling version shows how it actually evolved, the direct answer to "what's the
+  trend" rather than one snapshot number.
+
+### 8. Fundamentals (data points, not ratios)
+
+Per-ticker (Overview tab, fetched on demand): market capitalization, trailing/forward P/E, beta
+(the provider's own calculation — may differ slightly from the app's own `beta_vs_benchmark` above
+due to differing lookback windows/methodology), dividend yield, 52-week price range. Tried Finnhub
+first, Twelve Data as fallback (see the source-chain note further below) — the table's **Source**
+column shows which one actually answered for each ticker, rather than leaving that implicit.
+
+
 
 ## Repository structure
 
 ```
 portfolio-forecasting/
-├── app.py                 # Streamlit UI — orchestration only, no finance/LLM logic
+├── app.py                    # Streamlit UI — orchestration only, no finance/LLM logic
 ├── src/
-│   ├── config.py           # single source of truth: defaults, env vars, constants
-│   ├── market_data.py      # yfinance fetch + cache + frequency resampling
-│   ├── news_data.py        # NewsAPI headlines per ticker (fails soft if no key)
-│   ├── macro_data.py       # FRED: live 3-month T-bill rate, pre-fills the risk-free-rate slider
-│   ├── metrics.py          # pure finance math: returns, Sharpe, Sortino, VaR, CVaR, drawdown, beta
-│   ├── forecasting.py      # naive / ETS / ARIMA price forecasting (statsmodels)
-│   ├── optimization.py     # PyPortfolioOpt wrapper: mean-variance, efficient frontier
-│   ├── backtesting.py      # walk-forward (multi-window) validation of the 3-portfolio comparison
-│   ├── llm_client.py       # Groq primary + Ollama local fallback, one call site for both
-│   └── ai_features.py      # commentary / news digest / chatbot — prompt logic lives here
+│   ├── __init__.py
+│   ├── config.py              # single source of truth: defaults, env vars, constants
+│   ├── market_data.py         # yfinance fetch + cache + frequency resampling + fallback chain
+│   ├── news_data.py           # NewsAPI/Finnhub/SEC EDGAR headlines per ticker (fails soft if no key)
+│   ├── macro_data.py          # FRED: live 3-month T-bill rate, pre-fills the risk-free-rate slider
+│   ├── metrics.py             # pure finance math: returns, Sharpe, Sortino, VaR, CVaR, drawdown, beta
+│   ├── forecasting.py         # naive / ETS / ARIMA price forecasting (statsmodels), parallel across tickers
+│   ├── optimization.py        # PyPortfolioOpt wrapper: mean-variance, efficient frontier
+│   ├── backtesting.py         # walk-forward (multi-window) validation of the 3-portfolio comparison
+│   ├── llm_client.py          # Groq (multi-key rotation) + Ollama local fallback, one call site for both
+│   ├── ai_features.py         # commentary / news digest (parallel per ticker) / chatbot — prompt logic lives here
+│   ├── rag.py                  # TF-IDF retrieval over the news/filings corpus for chatbot Q&A
+│   ├── timeseries_diagnostics.py  # ADF stationarity, Hurst exponent, rolling Sharpe
+│   └── factor_models.py       # PCA statistical factor model (covariance for wide universes)
 ├── tests/
-│   └── test_metrics.py     # unit tests for the finance formulas (hand-checkable synthetic data)
+│   ├── __init__.py
+│   ├── test_metrics.py         # unit tests for the finance formulas (hand-checkable synthetic data)
+│   ├── test_optimization.py    # negative bounds, infeasible cap, degenerate mu<rf fallback
+│   ├── test_forecasting.py     # short-history and non-convergence fallback paths
+│   ├── test_backtesting.py     # expanding-window edge cases, end-to-end walk-forward smoke test
+│   ├── test_market_data.py     # fully mocked: Twelve Data partial-batch parsing, Yahoo circuit breaker
+│   ├── test_macro_data.py      # FRED divide_by pitfall (Sahm Rule), YoY calculation, GDP/PMI-proxy fetch
+│   ├── test_news_sentiment.py  # Finnhub -> VADER sentiment cascade, explicit "not available" case
+│   ├── test_timeseries_diagnostics.py  # ADF stationary vs. random walk, Hurst trending vs. mean-reverting
+│   └── test_factor_models.py   # PCA cov: symmetric/PSD, known factor-structure recovery, clamping
+├── .github/workflows/ci.yml  # pytest (blocking) + mypy (non-blocking) on every push/PR
 ├── requirements.txt
-├── Dockerfile               # containerised run — also the base for Render's `env: docker`
-├── render.yaml               # Render Blueprint (Infrastructure as Code)
-├── .streamlit/config.toml
-└── .env.example              # copy to .env and fill in your keys (never commit .env)
+├── Dockerfile                 # containerised run — also the base for Render's `env: docker`
+├── docker-compose.yml         # local Docker run with healthcheck
+├── build-docker.sh / deploy.sh / deploy.bat  # local build/run helpers (WSL, Linux/macOS, Windows)
+├── render.yaml                # Render Blueprint (Infrastructure as Code)
+├── .streamlit/config.toml     # theme/UI config — tracked (unlike secrets.toml, see .gitignore)
+├── .dockerignore
+├── .gitignore
+├── .env                       # your local keys — NEVER committed
+└── .env.example                # copy to .env and fill in your keys
 ```
 
 **Why this layout:** `src/metrics.py`, `src/forecasting.py`, and `src/optimization.py` have zero
@@ -239,14 +357,17 @@ the Groq→Ollama fallback (and future provider swaps) a one-file change.
 
 ## Key design decisions vs. the original brief
 
-The brief names some tools that are a poor fit for a 2-day solo delivery — documented here rather
-than silently swapped, since a technical interviewer will ask "why":
+The brief names some tools I found to be a poor fit for this scope — documented here rather
+than silently swapped:
 
 | Brief suggests | Used instead | Why |
 |---|---|---|
-| **Kats** for forecasting | **statsmodels** (ARIMA, Holt-Winters ETS) + a naive random-walk baseline | Kats has been effectively unmaintained since 2021 and conflicts with current pandas/numpy — the install alone would burn hours. statsmodels is the actively-maintained, industry-standard alternative. |
-| **Riskfolio-Lib** for optimization | **PyPortfolioOpt** | Lighter dependency footprint, actively maintained, covers exactly what's needed (max-Sharpe, min-vol, efficient frontier) without Riskfolio's heavier convex-optimization stack. |
-| **GitHub Pages** for deployment | **Streamlit Community Cloud** (primary) + **Render** (backup, via `render.yaml` + `Dockerfile`) | GitHub Pages only serves static sites — it cannot run a Streamlit server process. |
+| **Kats** for forecasting | **statsmodels** (ARIMA, Holt-Winters ETS) + a naive random-walk baseline | Kats' last PyPI release was **0.2.0 on 15 March 2022** — [pypi.org/project/kats/#history](https://pypi.org/project/kats/#history) — nothing published since, so it predates ~3.5 years of pandas/numpy releases. statsmodels is the actively-maintained, industry-standard alternative. |
+| **Riskfolio-Lib** for optimization | **PyPortfolioOpt** | Riskfolio-Lib is built on `cvxpy` with a much broader feature set (12 convex risk measures, Black-Litterman, risk factors, tracking-error/turnover constraints — [pypi.org/project/Riskfolio-Lib](https://pypi.org/project/Riskfolio-Lib/)), which is real capability but heavier than this project needs. PyPortfolioOpt ([pypi.org/project/pyportfolioopt](https://pypi.org/project/pyportfolioopt/)) covers exactly max-Sharpe/min-vol/efficient-frontier with a lighter dependency footprint. |
+| **GitHub Pages** for deployment | **Streamlit Community Cloud** (primary) + **Render** (backup, via `render.yaml` + `Dockerfile`) | GitHub Pages serves static files only — "GitHub Pages does not support server-side languages such as PHP, Ruby, or Python" ([official GitHub Docs](https://docs.github.com/articles/creating-project-pages-manually)) — it cannot run a Streamlit server process. |
+| **ISM Manufacturing PMI** for macro context | **Industrial Production Index (FRED `INDPRO`)** | ISM's PMI is a paid, proprietary survey-based series — not available on FRED or any free API. Industrial Production is the closest legitimate free alternative: real output data rather than a survey diffusion index, but it captures the same underlying signal (manufacturing-sector momentum). |
+| **Airflow** for orchestration | **None — on-demand fetch inside Streamlit's own request-response cycle** | This app is interactive and synchronous (change a sidebar parameter, it recomputes), not a scheduled batch pipeline — there's no recurring DAG to orchestrate. Airflow would mean deploying a scheduler + webserver + metadata DB for zero present need, the same over-engineering trap Riskfolio-Lib was avoided for above. It would become the right tool if this moved from live per-request fetches to nightly pre-materialised data — noted as a real future option, not dismissed outright. |
+| **LangChain / LangGraph** for the LLM layer | **Custom `llm_client.py`** (one call site, Groq→Ollama fallback, multi-key rotation) | Every LLM use in this app (commentary, news digest, chatbot) is a single, well-defined call with context injection — no multi-step agent deciding which tool to call next, no complex cross-session memory to manage. LangChain/LangGraph earn their weight when an agent genuinely orchestrates multiple tools/steps dynamically; here it would be a heavy dependency hiding a simpler fallback/rotation mechanism behind an abstraction layer, for no functional gain. |
 
 ## The three-portfolio comparison, precisely
 
@@ -327,10 +448,20 @@ streamlit run app.py
 | Key | Where to get it | Required? |
 |---|---|---|
 | `GROQ_API_KEY` (+ optional `_2` .. `_5`) | [console.groq.com](https://console.groq.com) | Optional — AI Analyst tab falls back to local Ollama without it |
-| `NEWSAPI_KEY` | [newsapi.org](https://newsapi.org/register) (100 req/day free) | Optional — news digest shows "unavailable" without it |
-| `FRED_API_KEY` | [fred.stlouisfed.org](https://fred.stlouisfed.org/docs/api/api_key.html) | Optional — risk-free rate slider falls back to a fixed 4% default without it |
-| `TWELVEDATA_API_KEY` | [twelvedata.com](https://twelvedata.com) (free, 800 req/day) | Optional — used only as a fallback if Yahoo Finance is unreachable |
+| `NEWSAPI_KEY` | [newsapi.org](https://newsapi.org/register) (100 req/day free) | Optional — one of three news/filing sources; digest still works with any subset configured |
+| `FINNHUB_API_KEY` | [finnhub.io](https://finnhub.io/register) (free, 60 req/**min**) | Optional — dedicated financial-news API, cross-referenced alongside NewsAPI and SEC EDGAR; also the primary source for per-ticker fundamentals |
+| `FRED_API_KEY` | [fred.stlouisfed.org](https://fred.stlouisfed.org/docs/api/api_key.html) | Optional — risk-free rate slider and macro panel fall back to a fixed 4% default / n/a without it |
+| `TWELVEDATA_API_KEY` | [twelvedata.com](https://twelvedata.com) (free, 800 req/day) | Optional — fallback market data source if Yahoo Finance is unreachable, and fallback fundamentals source (mainly covers `AAPL` on the free tier — see caveat below) |
 | Ollama (local fallback) | `ollama serve` + `ollama pull llama3.1` — [ollama.com](https://ollama.com) | Optional — only used if Groq fails/is unset |
+
+**News digest cross-referencing.** The AI Analyst's news digest pulls from three genuinely
+different source types rather than one: NewsAPI (general media), Finnhub (dedicated financial
+news, far more generous free-tier quota), and SEC EDGAR full-text search (free, no key —
+primary-source 8-K "material event" filings, not journalism about the company). Each headline
+in the UI's "Sources" expander is tagged with which provider it came from; the LLM prompt
+explicitly treats SEC filings as more authoritative than media coverage of the same event and
+notes when multiple sources corroborate the same story. Works with any subset of the three news
+keys configured — missing one just means fewer sources, not a broken feature.
 
 Market data (`yfinance`) needs no key. The app runs fully without *any* key — you just lose the
 AI Analyst tab's content and the live risk-free rate, not the core optimization/forecasting/
@@ -428,27 +559,80 @@ Beyond the brief's 5 default equities and the ETF/commodity sleeve:
 - *Brief default (5)*: AAPL/MSFT/TSLA/AMZN/GOOG, as specified.
 - *Mega Caps (15)*: the largest, most-recognised S&P 500 names across sectors — a one-click
   "give me something sensible" option.
-- *Custom / sector picker*: build a universe from 11 GICS sectors (~5-8 liquid names each, ~59
-  tickers total). Deliberately NOT all ~500 S&P constituents — see the callout below.
+- *Custom / sector picker*: build a universe from 11 GICS sectors (7-12 liquid names each, 104
+  tickers total — expanded 2026-09 from an initial ~59). Deliberately NOT all ~500 S&P
+  constituents — see the callout below.
 
 **Why not all 500 S&P constituents:** covariance estimation degrades badly with hundreds of
 names and only a few years of daily history (the classic "more parameters than data" problem);
 real buy-side desks handle this with factor models (Barra, Fama-French) or sector-constrained
 universes, not a raw 500×500 mean-variance optimisation on a handful of return observations per
 pair. A curated, sector-organised universe is the professionally correct choice here, not a
-scope-limited shortcut.
+scope-limited shortcut. **The 104-ticker universe already sits at the point where this matters in
+practice** — which is exactly why the covariance estimator below exists.
+
+**Covariance estimation: Ledoit-Wolf shrinkage vs. PCA factor model** (added 2026-09, sidebar
+"Covariance estimator")
+
+The math, precisely: with N assets, a covariance matrix has N(N+1)/2 free parameters — 5,460 for
+this app's full 104-ticker universe, against at best a few thousand daily observations. Ledoit-Wolf
+shrinkage (the long-standing default here) is a real fix for a *small* universe's noisy sample
+covariance, but it doesn't remove the underlying degrees-of-freedom problem — it just shrinks
+toward a target. A **PCA statistical factor model** does remove it: assume returns are driven by a
+small number of common factors plus asset-specific noise, and the parameter count collapses from
+N(N+1)/2 down to roughly N × k (k = factor count) + N. This is the SAME core idea real buy-side
+desks use (Barra, APT) for exactly this problem — implemented here as a *statistical* factor model
+(PCA extracts factors directly from the return data, orthogonal by construction), not a
+*fundamental* one like Barra (pre-specified style factors — value, size, momentum — fit by
+cross-sectional regression against company characteristics), which this project has neither the
+fundamentals data nor the scope to build. Documented as that honest simplification, not oversold
+as a Barra reimplementation.
+
+- **When to use which**: Ledoit-Wolf for the default small universes (5-15 tickers); PCA once you
+  build a wide custom universe (~40+ tickers via the sector picker).
+- **Where it applies**: one dispatch point (`optimization.historical_mu_cov`'s `cov_method`
+  parameter), threaded through every place a covariance is estimated — Efficient Frontier,
+  Forecast & Compare, and the walk-forward validation all use the same choice, never Ledoit-Wolf
+  in one tab and PCA in another.
+- **Transparency**: the Efficient Frontier tab shows the actual cumulative explained variance for
+  the chosen factor count — a factor model explaining 35% of variance is a materially weaker
+  covariance estimate than one explaining 85%, and that number is surfaced directly rather than
+  left implicit in a black-box matrix.
+- See `src/factor_models.py`'s docstring for the full derivation and the orthogonal-factor-model
+  assumption (idiosyncratic risk uncorrelated across assets) that makes the parameter-count
+  reduction work.
 
 **Advanced risk-adjusted metrics** (Calmar, Omega, Information Ratio, Treynor, Beta) — full
 formulas and interpretation guidance in **"Understanding the KPIs"** near the top of this README.
 
 **Per-ticker fundamentals** (Overview tab, fetched on demand via a button — not automatic, to
-conserve Twelve Data's daily quota): market cap, trailing/forward P/E, beta, dividend yield,
-52-week range. Requires `TWELVEDATA_API_KEY`. **Caveat, stated plainly:** Twelve Data's
-`/statistics` endpoint has fields documented as premium-plan-only, and exact free-tier field
-availability wasn't verifiable without a live key during development — the parser is defensive
-(every field is a best-effort lookup with a `—` fallback), but if your key returns an unexpected
-shape, `curl` the endpoint directly to inspect the real response rather than assuming the parser
-covers it.
+conserve API quota): market cap, trailing P/E, beta, dividend yield, price-to-book, 52-week range.
+
+**Source chain, updated 2026-09-03 after live testing exposed a real limitation:** Twelve Data's
+`/statistics` endpoint turned out to be restricted on the free tier to their public demo symbol
+(`AAPL`) — every other ticker returned a `403 {"message": "/statistics is available exclusively
+with pro or ultra or venture or enterprise plans"}`, confirmed directly via `curl`. Rather than
+ship a feature that only works for one hardcoded ticker, fundamentals now try **Finnhub first**
+(`/stock/profile2` + `/stock/metric`) — confirmed free-tier for arbitrary tickers, and you likely
+already have `FINNHUB_API_KEY` configured for the news digest — falling back to Twelve Data only
+if Finnhub isn't configured or returns nothing (which still covers `AAPL` via the demo-symbol
+path). Two Finnhub-specific parsing quirks worth knowing if this needs debugging later: market cap
+is returned in **millions**, not raw units (multiplied by 1e6 in code to match the display format),
+and dividend yield is a **percentage number** (e.g. `0.72` for 0.72%), not a decimal fraction
+(divided by 100 in code to match). Finnhub's field names were confirmed via public documentation
+and multiple independent working code examples, not a live key in this environment — if a field
+looks wrong, `curl` both endpoints directly before assuming the parser is stale.
+
+**News sentiment (AI Analyst tab, next to the news digest):** same source-chain philosophy as
+fundamentals — try the best genuinely-free source first, fall back rather than fail. Finnhub's
+own `/news-sentiment` endpoint (an aggregation over a much wider article set than the ~5
+headlines this app fetches per ticker) is tried first; if it's unavailable (no key, or
+plan-restricted on some accounts — unverified against a live key here), sentiment is computed
+**locally** with VADER (a free, offline, lexicon-based scorer — no API key, no model download,
+tuned for short informal text) on the headlines already fetched for the digest. If neither
+source has anything, the UI shows an explicit "sentiment not available" message rather than a
+silent blank, which would otherwise read as a false "neutral" claim. Every sentiment reading is
+tagged with which of the two computed it.
 
 ## Sources (from the brief)
 
@@ -470,30 +654,114 @@ Tools and references the original brief pointed to. Kept as-is unless noted othe
 
 1. **Fair out-of-sample comparison design.** The trap in a "forecast vs. realized" comparison is
    letting any forward-looking information leak into the historical/forecast portfolios' training
-   window. Solved by a strict train/test split: μ and Σ for portfolios 1 and 2 are estimated
-   *only* on data before the held-out window, and all three weight vectors are evaluated on the
-   identical realized returns of that window — so the bar chart genuinely isolates allocation
-   skill from lucky market conditions.
+   window. I solved this with a strict train/test split: μ and Σ for portfolios 1 and 2 are
+   estimated *only* on data before the held-out window, and all three weight vectors are evaluated
+   on the identical realized returns of that window — so the bar chart genuinely isolates
+   allocation skill from lucky market conditions.
 
 2. **PyPortfolioOpt's `max_sharpe()` fails hard, not soft, when every asset's expected return is
    below the risk-free rate** (a realistic case — pick a bear-market date range, or a forecast
    that goes negative). It raises a plain `ValueError`, not its own `OptimizationError`, so a
    naive `except OptimizationError` silently misses it and crashes the app on a very plausible
-   user input. Caught explicitly (see `optimization.py`) with a min-volatility fallback, and
-   verified with a synthetic bear-market test case, not just the happy path.
+   user input. I caught it explicitly (see `optimization.py`) with a min-volatility fallback, and
+   verified it with a synthetic bear-market test case, not just the happy path.
 
 3. **Keeping the LLM grounded to avoid hallucinated numbers.** A finance tool that confidently
-   states a wrong Sharpe ratio is worse than a tool that says nothing. Solved with an explicit
-   context-injection pattern (`ai_features.build_results_context`): every computed number the LLM
-   is allowed to reference is serialised into the prompt, and the system prompt explicitly
+   states a wrong Sharpe ratio is worse than a tool that says nothing. I solved this with an
+   explicit context-injection pattern (`ai_features.build_results_context`): every computed number
+   the LLM is allowed to reference is serialised into the prompt, and the system prompt explicitly
    instructs the model to say "not available" rather than estimate a figure not present there.
 
-## What's out of scope (by design, given the 2-day window)
+4. **Per-ticker forecasting and news fetching were the two biggest wall-clock costs** (ARIMA
+   fitting across many windows/assets; three sequential HTTP calls per ticker for the news
+   digest). I parallelised both with `concurrent.futures.ThreadPoolExecutor`, capped at 8 workers
+   to avoid oversubscribing a small container. I used threads rather than processes for the ARIMA
+   case specifically: the fitting is dominated by numpy/scipy linear algebra, which releases the
+   GIL during BLAS calls, so threads give a real speedup without the pickling/Streamlit-context
+   fragility subprocesses would add. I kept column/ticker order explicit (`executor.map` for
+   forecasting, original-order iteration over a completion-order results dict for news) so
+   parallelising never makes output order depend on which network call happened to finish first.
 
-- Short selling / leverage (long-only optimization; `weight_bounds` in `optimization.py` can be
-  opened to `(-1, 1)` if needed later).
-- Transaction costs and rebalancing frequency in the backtest.
-- Full RAG for the chatbot — the current approach (context injection of the computed results) is
-  the right-sized solution for a small, fixed set of numbers; a vector store would be unjustified
-  overhead here, but is the natural next step if this grew to cover a large news/filings corpus.
-# portfolio_forecasting
+## Short selling, transaction costs, and RAG
+
+Three things previously listed as deliberately out of scope for the 2-day window, added once
+there was time to do them properly rather than as an afterthought:
+
+**Short selling / leverage.** Sidebar toggle "Allow short selling" — off by default (long-only,
+weights ≥ 0), on makes bounds symmetric (`-cap` to `+cap` around the same max-weight setting).
+The portfolio stays fully invested (weights still sum to 100%); this does not add gross leverage
+beyond that. `resolve_weight_bounds()` in `optimization.py` centralises the long-only vs.
+long-short logic so every optimizer call site (frontier, single-window comparison, walk-forward)
+stays consistent.
+
+**Transaction costs & rebalancing frequency.** Sidebar slider "Transaction cost (bps per
+rebalance)", default 10 bps. Charged as `turnover × cost rate` at every point a portfolio
+actually rebalances: once for the initial trade in the single-window comparison, and at every
+walk-forward window boundary — tracked independently per portfolio type against ITS OWN previous
+weights, not a shared reference. "Rebalancing frequency" surfaces through the existing forecast
+horizon control rather than a separate parameter: a shorter horizon means more walk-forward
+windows over the same history, i.e. more frequent rebalancing, i.e. more cumulative cost drag —
+shortening the horizon is how to see this effect directly. Set the cost to 0 for the frictionless
+textbook comparison. `compute_turnover()` / `apply_transaction_cost()` in `metrics.py`.
+
+**RAG for the chatbot.** A genuine index-then-retrieve pipeline (`src/rag.py`) over the news/
+filings corpus collected in the AI Analyst tab, kept deliberately separate from the context-
+injection approach still used for portfolio metrics (that distinction is the point — metrics are
+a small, fixed, must-be-complete set of numbers where full injection is correct; news/filings are
+unstructured and only the query-relevant subset should reach the prompt). TF-IDF + cosine
+similarity was chosen over neural embeddings: this corpus is small and rebuilt fresh every
+session (no persistence), so a sentence-transformers model would add a large, slow-to-install
+dependency for retrieval-quality gains that don't matter at this scale — scikit-learn (already a
+transitive dependency via PyPortfolioOpt's `cvxpy` stack) is sufficient and dependency-light. Only
+the top-4 chunks relevant to the user's specific question are retrieved and injected — verified
+directly: a question about NVDA earnings pulls in the NVDA news chunk but not an unrelated Apple
+one, and a pure concept question ("what is Sharpe ratio") retrieves nothing and injects no RAG
+block at all, rather than force-fitting irrelevant news into every answer. If this corpus grew
+into hundreds of persisted documents across sessions, a real vector store (Chroma/FAISS) with
+neural embeddings would be the right upgrade — noted here as the natural next step, not built
+because it would be unjustified complexity at the current corpus size.
+
+## Known limitations
+
+Things I'm aware of and chose not to fix within this project's scope, rather than gaps I missed:
+
+- **Short-horizon price forecasting genuinely has weak predictive power.** The whole app is built
+  around this honestly (win-rate near 50% is the expected result, not a bug) — but it means the
+  "Forecast-based" portfolio should never be read as an actionable signal, only as a methodology
+  demonstration. I say this explicitly in three places in the UI so it can't be missed.
+- **The forecasted covariance matrix is still historical**, not forecasted (see
+  `optimization.py`'s docstring) — standard practice even in forecast-driven allocation, but worth
+  stating plainly: only μ comes from the forecast, Σ never does.
+- **The Yahoo circuit breaker is process-wide, not per-session.** On a multi-user deployment
+  (Streamlit Community Cloud, Render), if Yahoo fails for one user it's skipped for everyone for
+  the next 3 minutes. I think this is the right trade-off (Yahoo being down is a server-side fact,
+  not a per-user one), but it's a deliberate simplification worth flagging, not an oversight.
+- **RAG (`rag.py`) has no persistence** — the news/filings corpus is rebuilt fresh every session,
+  so TF-IDF retrieval quality resets each time and can't learn from accumulated history.
+- **CI's `mypy` step is non-blocking for now** (`continue-on-error: true` in `ci.yml`) — the
+  codebase wasn't written under mypy from day one, so a first strict run surfaces a backlog I
+  haven't triaged yet. `pytest` is the blocking gate today.
+- **`.dockerignore`/local `.venv` aren't tracked in git** by design, but the Dockerfile currently
+  pins `python:3.12-slim` while `requirements.txt`'s comments were written against Python 3.14
+  compatibility testing — I haven't fully reconciled the two yet (flagged, not yet resolved).
+
+## Next steps
+
+Roughly in the order I'd tackle them:
+
+1. **Blocking `mypy --strict`** once the current backlog is triaged — the codebase is already
+   fully type-hinted (`from __future__ import annotations` everywhere), so the marginal cost of
+   turning this on for real is low relative to the safety net it adds.
+2. **Session-scoped Yahoo circuit breaker** if this ever moves to genuine multi-tenant use, so one
+   user's Yahoo failure doesn't affect another's.
+3. **A real vector store (Chroma/FAISS) for RAG** if the news/filings corpus ever gets persisted
+   across sessions instead of rebuilt fresh each time — noted in `rag.py`'s own docstring as the
+   natural upgrade path, not built now because it would be unjustified complexity at the current
+   scale.
+4. **Reconcile the Dockerfile's Python version** with what `requirements.txt` was actually tested
+   against, so local dev and the containerised deploy can't silently diverge.
+5. **LangGraph, if the AI Analyst ever becomes a real multi-step agent** — e.g. deciding on its own
+   to pull fresh news, recompute a scenario, then compare it against the current portfolio, instead
+   of the three fixed, hand-wired features (commentary/digest/chatbot) it is today. Not needed for
+   the current scope (see "Key design decisions" above), but the natural next step if the AI layer
+   grows from "answers questions about fixed numbers" into "decides what to compute next."

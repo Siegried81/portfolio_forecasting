@@ -25,6 +25,7 @@ short-horizon price forecasts should be trusted for real allocation decisions.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import warnings
 
 import numpy as np
@@ -129,12 +130,35 @@ def forecast_all_assets(
     horizon: int,
     model_name: str = "ETS (Holt linear trend)",
 ) -> pd.DataFrame:
-    """Run the chosen model independently per asset (no cross-asset correlation in
+    """
+    Run the chosen model independently per asset (no cross-asset correlation in
     the forecast itself — that's handled downstream by the covariance matrix used
-    in optimization) and return a single DataFrame of forecasted prices."""
+    in optimization) and return a single DataFrame of forecasted prices.
+
+    PARALLELIZED (2026-09-04) across tickers with a thread pool — this was the
+    single biggest speed bottleneck flagged in the README ("ARIMA across many
+    windows/assets is noticeably slower"), and it compounds badly because this
+    exact function is also called once PER walk-forward window. Threads, not
+    processes: ARIMA/ETS fitting is dominated by numpy/scipy linear algebra,
+    which releases the GIL during BLAS calls, so threads give a real wall-clock
+    speedup here without the pickling and Streamlit-context fragility that
+    spinning subprocesses from inside a Streamlit callback would introduce.
+    `max_workers` is capped at 8 to avoid oversubscribing a small container
+    (e.g. Render's free tier) when a large universe is selected.
+    """
     model_fn = FORECAST_MODELS[model_name]
-    forecasts = {}
-    for ticker in prices.columns:
+    tickers = list(prices.columns)
+
+    def _forecast_one(ticker: str) -> pd.Series:
         series = prices[ticker].dropna()
-        forecasts[ticker] = model_fn(series, horizon)["forecast"]
+        return model_fn(series, horizon)["forecast"]
+
+    max_workers = min(8, len(tickers)) or 1
+    forecasts: dict[str, pd.Series] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # executor.map preserves input order, so the resulting dict — and the
+        # DataFrame built from it — always has columns in the same order as
+        # `prices.columns`, regardless of which thread finishes first.
+        for ticker, forecast in zip(tickers, executor.map(_forecast_one, tickers)):
+            forecasts[ticker] = forecast
     return pd.DataFrame(forecasts)

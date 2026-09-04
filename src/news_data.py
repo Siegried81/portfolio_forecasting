@@ -163,3 +163,120 @@ def fetch_sec_filings(company_name: str, ticker: str, max_filings: int = 3) -> l
             "provider": "SEC EDGAR",
         })
     return results
+
+
+# ---------------------------------------------------------------------------
+# News sentiment — added 2026-09-04. Cascade: Finnhub's own aggregated
+# sentiment (PRIMARY, wider corpus than what this app fetches itself) -> VADER
+# computed locally from the headlines already fetched above (FALLBACK, free,
+# offline, no key) -> None if there's truly nothing to score. Callers must
+# show an explicit "not available" message on None rather than silently
+# omitting the section — a blank sentiment section reads as "neutral", which
+# is a claim, not an absence of one.
+# ---------------------------------------------------------------------------
+
+FINNHUB_SENTIMENT_URL = "https://finnhub.io/api/v1/news-sentiment"
+
+
+@st.cache_data(show_spinner=False, ttl=1800)
+def fetch_finnhub_sentiment(ticker: str) -> dict | None:
+    """
+    Finnhub's own aggregated news-sentiment endpoint: bullish/bearish % across
+    a wider article set than the ~5 headlines this app fetches per ticker, plus
+    a weekly article-volume ("buzz") figure. Tried FIRST because it's a genuine
+    independent aggregation, not a second opinion computed from the same small
+    sample already on screen.
+
+    CAVEAT: this specific endpoint has been reported plan-restricted on some
+    Finnhub free-tier accounts (inconsistent with their published free-tier
+    feature list, similar in spirit to the Twelve Data /statistics situation
+    documented elsewhere in this app) — not verified against a live key in
+    this environment. Fails soft (returns None) on ANY error, including a 403,
+    so `get_ticker_sentiment` below always has the local VADER fallback to
+    fall back to rather than surfacing a raw API error to the user.
+    """
+    if not LLM_SETTINGS.finnhub_api_key:
+        return None
+    try:
+        response = requests.get(
+            FINNHUB_SENTIMENT_URL, params={"symbol": ticker, "token": LLM_SETTINGS.finnhub_api_key}, timeout=10,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except (requests.RequestException, ValueError) as exc:
+        logger.warning("Finnhub sentiment fetch failed for %s: %s", ticker, exc)
+        return None
+
+    sentiment = payload.get("sentiment") or {}
+    bullish = sentiment.get("bullishPercent")
+    bearish = sentiment.get("bearishPercent")
+    if bullish is None or bearish is None:
+        return None  # Finnhub returns an empty/zeroed shape for tickers it has no coverage for
+
+    return {
+        "provider": "Finnhub (aggregated)",
+        "bullish_pct": bullish * 100,
+        "bearish_pct": bearish * 100,
+        # Normalised to [-1, 1] so it's directly comparable to VADER's compound
+        # score below — callers apply the SAME +/-0.1 threshold either way.
+        "score": bullish - bearish,
+        "n_articles": (payload.get("buzz") or {}).get("articlesInLastWeek"),
+    }
+
+
+_vader_analyzer = None  # lazy singleton — building the lexicon has a small fixed cost
+
+
+def _get_vader_analyzer():
+    global _vader_analyzer
+    if _vader_analyzer is None:
+        from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
+        _vader_analyzer = SentimentIntensityAnalyzer()
+    return _vader_analyzer
+
+
+def compute_local_sentiment(articles: list[dict]) -> dict | None:
+    """
+    Fallback sentiment scored locally from the headlines/descriptions already
+    fetched above, when Finnhub's own endpoint isn't available. VADER (Valence
+    Aware Dictionary and sEntiment Reasoner) was chosen for the same reason
+    TF-IDF was chosen over neural embeddings in rag.py: this is a small, cheap,
+    deterministic scoring pass on a handful of short texts — not worth burning
+    LLM budget or adding latency for. It's free, fully offline (a bundled
+    lexicon, no model download, no API key), and specifically tuned for short,
+    informal text, which headlines are closer to than to long-form prose.
+
+    Returns None if there's nothing to score (no articles at all) — that case
+    is distinct from "computed a neutral score" and callers must not conflate
+    the two.
+    """
+    if not articles:
+        return None
+    analyzer = _get_vader_analyzer()
+    scores = [
+        analyzer.polarity_scores(f"{a.get('title', '')}. {a.get('description', '')}")["compound"]
+        for a in articles
+    ]
+    avg_score = sum(scores) / len(scores)
+    bullish_count = sum(1 for s in scores if s > 0.05)   # VADER's own documented neutral band
+    bearish_count = sum(1 for s in scores if s < -0.05)
+    return {
+        "provider": "VADER (computed locally from fetched headlines)",
+        "bullish_pct": 100 * bullish_count / len(scores),
+        "bearish_pct": 100 * bearish_count / len(scores),
+        "score": avg_score,
+        "n_articles": len(scores),
+    }
+
+
+def get_ticker_sentiment(ticker: str, articles: list[dict]) -> dict | None:
+    """
+    Single entry point for sentiment on one ticker: Finnhub's aggregated score
+    if available, else VADER computed from `articles` (already fetched by the
+    caller — no extra network call), else None. Callers show an explicit
+    "sentiment not available" message on None, never a silent blank.
+    """
+    sentiment = fetch_finnhub_sentiment(ticker)
+    if sentiment is not None:
+        return sentiment
+    return compute_local_sentiment(articles)

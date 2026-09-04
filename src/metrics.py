@@ -204,6 +204,88 @@ def treynor_ratio(
     return (ann_return - risk_free_rate) / beta
 
 
+def jensens_alpha(
+    returns: pd.Series,
+    benchmark_returns: pd.Series,
+    beta: float,
+    risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+    periods_per_year: int = TRADING_DAYS_PER_YEAR,
+) -> float:
+    """
+    Jensen's Alpha (CAPM alpha): the annualised return actually earned ABOVE what
+    CAPM predicts given the portfolio's market exposure (beta) alone. This is the
+    standard textbook complement to Beta and Treynor — without it, Beta/Treynor
+    tell you HOW MUCH market risk was taken, but nothing answers "did that
+    risk-taking actually pay off beyond what beta alone would predict?" A
+    positive alpha means the portfolio outperformed its own CAPM benchmark (some
+    genuine edge, or luck — a single window can't tell those apart, same caveat
+    as everywhere else in this app); negative means it underperformed what its
+    market exposure alone would predict, even if raw Sharpe/Sortino look
+    acceptable in isolation.
+
+    Formula: alpha = R_p − [rf + beta × (R_m − rf)], every return annualised
+    first so alpha is expressed on the same annual scale as every other return
+    figure in this app.
+    """
+    ann_return = annualised_return(returns, periods_per_year)
+    ann_benchmark_return = annualised_return(benchmark_returns, periods_per_year)
+    if np.isnan(beta) or np.isnan(ann_return) or np.isnan(ann_benchmark_return):
+        return float("nan")
+    expected_return = risk_free_rate + beta * (ann_benchmark_return - risk_free_rate)
+    return ann_return - expected_return
+
+
+def ulcer_index(returns: pd.Series) -> float:
+    """
+    Ulcer Index (Peter Martin, 1987) — added 2026-09-04 because Max Drawdown
+    alone only captures the SINGLE worst point, not how long the portfolio
+    stayed underwater. Computed as the root-mean-square of the percentage
+    drawdown at EVERY point in the series (in percentage points, Martin's
+    original convention — e.g. 12.3, not 0.123), not just the worst one: a
+    portfolio stuck at -20% for a year scores far worse here than one that
+    dips to -20% for a single week and recovers, even though both share the
+    identical Max Drawdown. Lower is better; 0 means the wealth curve never
+    dipped below any prior peak. No universal "good" threshold — compare it
+    across the three portfolios the same way Calmar is compared, not against
+    a memorised number.
+    """
+    wealth_index = (1.0 + returns).cumprod()
+    running_max = wealth_index.cummax()
+    drawdown_pct = (wealth_index / running_max - 1.0) * 100.0
+    return float(np.sqrt((drawdown_pct ** 2).mean()))
+
+
+def return_skewness(returns: pd.Series) -> float:
+    """
+    Skewness of the return distribution (third standardised moment) — added
+    2026-09-04 alongside kurtosis to make explicit WHY Omega sometimes
+    diverges from Sharpe/Sortino, instead of leaving that as an implicit
+    "trust the number" (Omega's docstring already flagged this gap). Zero =
+    symmetric; negative = a longer/fatter LEFT tail (occasional large losses
+    — the shape most equity return series actually have, and exactly the
+    asymmetry Sortino/Omega are built to catch that Sharpe's symmetric
+    variance can't); positive = a longer/fatter right tail (occasional large
+    gains). Uses pandas' own skew() (sample skewness, bias-corrected) — needs
+    at least 3 observations, NaN below that.
+    """
+    return float(returns.skew())
+
+
+def return_kurtosis(returns: pd.Series) -> float:
+    """
+    EXCESS kurtosis of the return distribution — added 2026-09-04 alongside
+    skewness, same rationale. Pandas' convention (matches the Fisher
+    definition used throughout finance): 0 = same tail thickness as a normal
+    distribution. Positive = fatter tails than normal (more extreme outcomes
+    than a Gaussian model would predict — the standard finding for equity
+    returns, and the reason VaR/CVaR above are computed non-parametrically
+    from the empirical distribution rather than assumed normal in the first
+    place). Negative = thinner tails than normal (uncommon for real return
+    series). Needs at least 4 observations; NaN below that.
+    """
+    return float(returns.kurt())
+
+
 def omega_ratio(returns: pd.Series, threshold: float = 0.0) -> float:
     """
     Probability-weighted ratio of total gains to total losses above/below a
@@ -249,6 +331,9 @@ def summarise_performance(
         "calmar_ratio": calmar_ratio(returns, periods_per_year),
         "omega_ratio": omega_ratio(returns),
         "max_drawdown": max_drawdown(returns),
+        "ulcer_index": ulcer_index(returns),
+        "skewness": return_skewness(returns),
+        "kurtosis": return_kurtosis(returns),
         "var_95": value_at_risk(returns, 0.95),
         "cvar_95": conditional_value_at_risk(returns, 0.95),
     }
@@ -257,6 +342,7 @@ def summarise_performance(
         summary["beta"] = beta
         summary["information_ratio"] = information_ratio(returns, benchmark_returns, periods_per_year)
         summary["treynor_ratio"] = treynor_ratio(returns, beta, risk_free_rate, periods_per_year)
+        summary["jensens_alpha"] = jensens_alpha(returns, benchmark_returns, beta, risk_free_rate, periods_per_year)
     return summary
 
 

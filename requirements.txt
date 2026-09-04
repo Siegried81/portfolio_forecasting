@@ -31,6 +31,14 @@ plotly>=5.24.1
 groq>=1.0.0   # groq<1.0 breaks with httpx>=0.28 (removed the "proxies" kwarg groq<1.0 still passes)
 requests>=2.32.3
 tiktoken>=0.8.0  # token counting, used to keep news context within LLM limits
+vaderSentiment>=3.3.2  # free, offline, lexicon-based news-sentiment fallback (no API key, no model download)
+
+# --- ML (used directly by rag.py's TF-IDF retrieval AND factor_models.py's PCA) ---
+# Previously only an IMPLICIT transitive dependency via PyPortfolioOpt's cvxpy
+# stack — pinned explicitly now that two modules import it directly, so a
+# future PyPortfolioOpt release dropping that transitive dep can't silently
+# break either one.
+scikit-learn>=1.5
 
 # --- Tests ---
 pytest>=8.3.3

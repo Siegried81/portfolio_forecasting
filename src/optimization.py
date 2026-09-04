@@ -22,28 +22,60 @@ import pandas as pd
 from pypfopt import EfficientFrontier, expected_returns, risk_models
 from pypfopt.exceptions import OptimizationError
 
-from src.config import DEFAULT_RISK_FREE_RATE, TRADING_DAYS_PER_YEAR
+from src.config import (
+    COV_METHOD_LEDOIT_WOLF,
+    COV_METHOD_PCA,
+    DEFAULT_COV_METHOD,
+    DEFAULT_PCA_FACTORS,
+    DEFAULT_RISK_FREE_RATE,
+    TRADING_DAYS_PER_YEAR,
+)
 
 
-def historical_mu_cov(prices: pd.DataFrame, periods_per_year: int = TRADING_DAYS_PER_YEAR) -> tuple[pd.Series, pd.DataFrame]:
+def historical_mu_cov(
+    prices: pd.DataFrame,
+    periods_per_year: int = TRADING_DAYS_PER_YEAR,
+    cov_method: str = DEFAULT_COV_METHOD,
+    n_factors: int = DEFAULT_PCA_FACTORS,
+) -> tuple[pd.Series, pd.DataFrame]:
     """
-    Annualised mean historical return (mu) and covariance (Ledoit-Wolf shrinkage)
-    from a price history. Shrinkage covariance is used instead of the raw sample
-    covariance because with few assets and a short history the sample covariance
-    is noisy and can produce unstable, extreme optimal weights — shrinkage is the
-    standard practitioner fix (per Ledoit & Wolf, 2004).
+    Annualised mean historical return (mu) and covariance from a price
+    history. `cov_method` selects between two genuinely different covariance
+    ESTIMATORS — mu is always the same historical mean either way:
+
+    - `"ledoit_wolf"` (default): shrinkage covariance, the long-standing
+      approach here. With few assets and a short history the raw sample
+      covariance is noisy and can produce unstable, extreme optimal weights
+      — shrinkage is the standard practitioner fix (Ledoit & Wolf, 2004).
+    - `"pca"`: a statistical factor-model covariance (see
+      `factor_models.pca_factor_cov`) — the tractable alternative once the
+      universe gets wide relative to the history available (see that
+      module's docstring and README's "Why not all 500 S&P constituents").
+
+    Single dispatch point, kept here rather than scattered across call
+    sites, so every caller (frontier, single-window comparison, walk-forward)
+    picks up the same estimator from one config choice — this module's own
+    stated design goal of staying agnostic to WHERE mu/cov come from.
 
     `periods_per_year` MUST match the actual periodicity of `prices` (252 for
     daily, 52 for weekly, 12 for monthly — see config.FREQUENCY_TO_PERIODS_PER_YEAR).
-    Passing the wrong value here doesn't error — PyPortfolioOpt just silently
-    annualises as if every row were one trading day, which massively overstates
+    Passing the wrong value here doesn't error — it just silently annualises
+    as if every row were one trading day, which massively overstates
     "expected return" on weekly/monthly data (a ~5-year weekly series has ~260
     rows; annualising with frequency=252 treats that as barely one year of daily
     data, compounding the horizon by roughly 5x). Always pass the caller's actual
     `periods_per_year`, never rely on the default.
     """
     mu = expected_returns.mean_historical_return(prices, frequency=periods_per_year)
-    cov = risk_models.CovarianceShrinkage(prices, frequency=periods_per_year).ledoit_wolf()
+    if cov_method == COV_METHOD_PCA:
+        from src.factor_models import pca_factor_cov
+        returns = prices.pct_change().dropna(how="all")
+        cov, _diagnostics = pca_factor_cov(returns, n_factors=n_factors, periods_per_year=periods_per_year)
+        # Column/row order must match mu's index (PyPortfolioOpt assumes
+        # alignment by position, not by label, in several internal steps).
+        cov = cov.reindex(index=mu.index, columns=mu.index)
+    else:
+        cov = risk_models.CovarianceShrinkage(prices, frequency=periods_per_year).ledoit_wolf()
     return mu, cov
 
 
@@ -213,3 +245,41 @@ def portfolio_performance(
     vol = float(np.sqrt(np.dot(w, np.dot(cov, w))))
     sharpe = (ret - risk_free_rate) / vol if vol > 0 else float("nan")
     return {"expected_return": ret, "expected_volatility": vol, "expected_sharpe": sharpe}
+
+
+def diversification_ratio(weights: pd.Series, cov: pd.DataFrame) -> float:
+    """
+    Added 2026-09-04: the correlation matrix (Overview tab) is visual, not a
+    number — this is the number. Choueifaty & Coignard's Diversification Ratio
+    (2008): the weighted average of each asset's OWN volatility, divided by
+    the ACTUAL portfolio volatility. DR > 1 whenever correlations are below 1
+    everywhere (the normal case) — the gap between the two is precisely the
+    risk reduction diversification bought. DR = 1 only in the degenerate case
+    of a single-asset portfolio or perfectly correlated assets (correlation
+    matrix all 1.0), where diversification buys nothing. Higher is better;
+    there's no universal "good" threshold — compare it across the three
+    portfolios (historical/forecast/realized) the way Calmar is compared, not
+    against a memorised number.
+    """
+    w = weights.reindex(cov.index).fillna(0.0).values
+    individual_vols = np.sqrt(np.diag(cov.values))
+    weighted_avg_vol = float(np.dot(np.abs(w), individual_vols))
+    portfolio_vol = float(np.sqrt(np.dot(w, np.dot(cov.values, w))))
+    if portfolio_vol == 0:
+        return float("nan")
+    return weighted_avg_vol / portfolio_vol
+
+
+def concentration_hhi(weights: pd.Series) -> float:
+    """
+    Herfindahl-Hirschman Index on portfolio weights: sum(w_i^2). Ranges from
+    1/N (perfectly equal-weighted across N assets) to 1.0 (fully concentrated
+    in one asset). Distinct in kind from diversification_ratio above — HHI
+    measures ALLOCATION concentration itself (a quick sanity check that the
+    max-weight cap is actually doing its job), while the diversification
+    ratio measures the RISK benefit actually realised from that allocation.
+    Two portfolios can have the same HHI with very different diversification
+    ratios if their assets are differently correlated — that's not a
+    contradiction, it's the reason both numbers earn their place.
+    """
+    return float((weights ** 2).sum())
