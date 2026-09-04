@@ -1,0 +1,44 @@
+name: CI
+
+# Runs on every push and PR — catches a broken fallback branch (Twelve Data
+# parsing, ARIMA non-convergence, Groq key rotation, ...) or a type error
+# before it reaches Render/Streamlit Cloud, instead of being discovered live
+# during an interview demo.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install mypy
+
+      - name: Run tests
+        # No API keys configured in CI on purpose: every fetcher in this repo
+        # is designed to fail SOFT (return None/[] or fall back) without one,
+        # so the test suite must pass on a bare checkout, not just locally
+        # with a full .env — that's the whole point of the fallback design.
+        run: pytest -v
+
+      - name: Type check (non-blocking for now)
+        # continue-on-error: the codebase wasn't written under mypy from day
+        # one, so a first run will surface a backlog of pre-existing findings.
+        # Flip this to blocking once that backlog is triaged (tracked as a
+        # follow-up, not silently ignored forever).
+        continue-on-error: true
+        run: mypy --ignore-missing-imports src/
