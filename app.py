@@ -154,6 +154,23 @@ st.markdown(
 )
 
 
+def _format_ratio(x: float) -> str:
+    """
+    Format a ratio/metric value for display, distinguishing three genuinely
+    different cases that a single blanket "—" used to collapse into one:
+    NaN (undefined — e.g. zero volatility), +/-inf (Omega ratio with zero
+    losing periods in the sample), and an ordinary finite number. Showing
+    infinity as a bare "—" reads as a minus sign or a missing value, not as
+    "there were no losses at all" — a materially different, more informative
+    fact worth its own symbol (BUGFIX 2026-09-04).
+    """
+    if pd.isna(x):
+        return "—"          # genuinely missing/undefined
+    if np.isinf(x):
+        return "∞"          # no losing periods at all — not a minus sign
+    return f"{x:.2f}"
+
+
 # ----------------------------------------------------------------------------------
 # Sidebar — all user inputs live here, nowhere else, so the rest of the app can
 # just read st.session_state / the returned tuple without re-deriving inputs.
@@ -253,15 +270,24 @@ def render_sidebar() -> dict:
     fred_rate = fetch_current_risk_free_rate()
     rf_default = fred_rate if fred_rate is not None else DEFAULT_RISK_FREE_RATE
     rf_label = "Risk-free rate (annual)" + (" — live 3M T-bill via FRED" if fred_rate is not None else "")
-    risk_free_rate = st.sidebar.slider(rf_label, 0.0, 0.10, rf_default, 0.0025, format="%.2f%%")
-    max_weight_per_asset = st.sidebar.slider(
-        "Max weight per asset", 0.10, 1.00, DEFAULT_MAX_WEIGHT_PER_ASSET, 0.05, format="%.0f%%",
+    # BUGFIX (2026-09-04): st.slider's `format` string only controls DISPLAY, it never
+    # scales the underlying value (confirmed: streamlit/streamlit#4897) — a 0.0-0.10
+    # fraction with format="%.2f%%" was rendering "0.04%" for a 4% rate instead of
+    # "4.00%" (and "Max weight" was showing "0%"/"1%" instead of "35%"/"100%"). Fix:
+    # run the widget in percentage-POINT units (0-10, step 0.25) so the format string
+    # is finally accurate, then convert back to the fraction every downstream function
+    # (metrics.py, optimization.py) actually expects — no change to their inputs.
+    risk_free_rate_pct = st.sidebar.slider(rf_label, 0.0, 10.0, rf_default * 100, 0.25, format="%.2f%%")
+    risk_free_rate = risk_free_rate_pct / 100.0
+    max_weight_pct = st.sidebar.slider(
+        "Max weight per asset", 10.0, 100.0, DEFAULT_MAX_WEIGHT_PER_ASSET * 100, 5.0, format="%.0f%%",
         help="Position-size cap applied to every optimized portfolio (including the hindsight "
              "'realized-optimal' benchmark). Standard institutional practice — without it, "
              "optimizers happily put 100% into whichever single name got lucky, which is "
              "mathematically valid but not how any real portfolio is actually run. Automatically "
              "relaxed if it's tighter than 1/(number of assets selected).",
     )
+    max_weight_per_asset = max_weight_pct / 100.0
     allow_short_selling = st.sidebar.checkbox(
         "Allow short selling", value=False,
         help="Long-only by default (weights ≥ 0). Enabling this lets the optimizer take negative "
@@ -482,9 +508,10 @@ def render_overview_tab(prices: pd.DataFrame, tickers: list[str], periods_per_ye
                 "Ann. return": f"{m['annual_return']:.1%}",
                 "Ann. volatility": f"{m['annual_volatility']:.1%}",
                 "Sharpe": f"{m['sharpe_ratio']:.2f}",
+                "Sharpe SE": _format_ratio(m['sharpe_se']),
                 "Sortino": f"{m['sortino_ratio']:.2f}",
                 "Calmar": f"{m['calmar_ratio']:.2f}" if not pd.isna(m['calmar_ratio']) else "—",
-                "Omega": f"{m['omega_ratio']:.2f}" if not pd.isna(m['omega_ratio']) else "—",
+                "Omega": _format_ratio(m['omega_ratio']),
                 "Beta (vs SPY)": f"{m.get('beta', float('nan')):.2f}" if 'beta' in m and not pd.isna(m['beta']) else "—",
                 "Alpha (Jensen, ann.)": f"{m['jensens_alpha']:+.2%}" if 'jensens_alpha' in m and not pd.isna(m['jensens_alpha']) else "—",
                 "Max drawdown": f"{m['max_drawdown']:.1%}",
@@ -791,15 +818,15 @@ def render_forecast_compare_tab(
             display_df[col] = display_df[col].map(lambda x: f"{x:.1%}")
     if "jensens_alpha" in display_df.columns:
         display_df["jensens_alpha"] = display_df["jensens_alpha"].map(lambda x: f"{x:+.2%}" if not pd.isna(x) else "—")
-    for col in ["sharpe_ratio", "sortino_ratio", "calmar_ratio", "omega_ratio", "beta", "information_ratio",
+    for col in ["sharpe_ratio", "sharpe_se", "sortino_ratio", "calmar_ratio", "omega_ratio", "beta", "information_ratio",
                 "treynor_ratio", "ulcer_index", "skewness", "kurtosis"]:
         if col in display_df.columns:
-            display_df[col] = display_df[col].map(lambda x: f"{x:.2f}" if not pd.isna(x) and np.isfinite(x) else "—")
+            display_df[col] = display_df[col].map(_format_ratio)
     display_df = display_df.drop(columns=["n_periods"], errors="ignore")
     display_df = display_df.rename(columns={
         "period_return": f"Return ({horizon} periods, not annualised)",
         "annual_return": "Ann. return", "annual_volatility": "Ann. vol.", "sharpe_ratio": "Sharpe",
-        "sortino_ratio": "Sortino", "calmar_ratio": "Calmar", "omega_ratio": "Omega",
+        "sharpe_se": "Sharpe SE", "sortino_ratio": "Sortino", "calmar_ratio": "Calmar", "omega_ratio": "Omega",
         "max_drawdown": "Max DD", "var_95": "VaR 95%", "cvar_95": "CVaR 95%",
         "beta": "Beta (vs SPY)", "information_ratio": "Info. Ratio", "treynor_ratio": "Treynor",
         "jensens_alpha": "Alpha (Jensen)", "ulcer_index": "Ulcer Index",
@@ -817,7 +844,9 @@ def render_forecast_compare_tab(
         "Calmar = return per unit of worst drawdown lived through. Omega = full-distribution "
         "gain/loss ratio (catches skew Sharpe/Sortino can miss). Information Ratio = consistency "
         "of the edge over SPY. Treynor = return per unit of market (systematic) risk, vs Sharpe's "
-        "total-risk denominator."
+        "total-risk denominator. Sharpe SE = approximate standard error of the Sharpe estimate "
+        "itself (Lo, 2002) — a rough 95% range is Sharpe ± 1.96×SE; a wide range relative to the "
+        "point estimate is the statistical reason a short-window Sharpe shouldn't be over-trusted."
     )
 
     fig = go.Figure()

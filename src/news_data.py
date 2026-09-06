@@ -51,7 +51,7 @@ def fetch_ticker_headlines(ticker: str, company_name: str | None = None, max_art
         return []
 
     query = company_name or ticker
-    since = (dt.datetime.utcnow() - dt.timedelta(days=NEWS_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=NEWS_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
     params = {
         "q": query, "from": since, "sortBy": "relevancy", "language": "en",
         "pageSize": max_articles, "apiKey": LLM_SETTINGS.newsapi_key,
@@ -89,8 +89,8 @@ def fetch_finnhub_news(ticker: str, max_articles: int = 5) -> list[dict]:
     if not LLM_SETTINGS.finnhub_api_key:
         return []
 
-    since = (dt.datetime.utcnow() - dt.timedelta(days=NEWS_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
-    today = dt.datetime.utcnow().strftime("%Y-%m-%d")
+    since = (dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=NEWS_LOOKBACK_DAYS)).strftime("%Y-%m-%d")
+    today = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d")
     params = {"symbol": ticker, "from": since, "to": today, "token": LLM_SETTINGS.finnhub_api_key}
 
     try:

@@ -22,6 +22,7 @@ from src.metrics import (
     return_kurtosis,
     return_skewness,
     sharpe_ratio,
+    sharpe_ratio_standard_error,
     sortino_ratio,
     summarise_performance,
     treynor_ratio,
@@ -234,6 +235,54 @@ def test_return_kurtosis_higher_for_fatter_tailed_series():
     normal_ish = pd.Series([0.00, 0.01, -0.01, 0.02, -0.02, 0.01, -0.01, 0.00])
     fat_tailed = pd.Series([0.00, 0.01, -0.01, 0.02, -0.02, 0.01, -0.01, 0.25])
     assert return_kurtosis(fat_tailed) > return_kurtosis(normal_ish)
+
+
+# ---------------------------------------------------------------------------
+# sharpe_ratio_standard_error
+# ---------------------------------------------------------------------------
+
+def test_sharpe_se_matches_lo_2002_formula_at_unit_frequency():
+    # At periods_per_year=1, "per-period" and "annualised" Sharpe coincide, so
+    # the formula SE = sqrt((1 + 0.5*SR^2) / n) can be checked directly against
+    # sharpe_ratio()'s own output rather than a separately hand-computed number.
+    returns = pd.Series([0.10, -0.05, 0.08, -0.02, 0.03])
+    sr = sharpe_ratio(returns, risk_free_rate=0.0, periods_per_year=1)
+    se = sharpe_ratio_standard_error(returns, risk_free_rate=0.0, periods_per_year=1)
+    expected = np.sqrt((1.0 + 0.5 * sr ** 2) / len(returns))
+    assert se == pytest.approx(expected, rel=1e-9)
+
+
+def test_sharpe_se_scales_with_sqrt_periods_per_year():
+    # Same per-period excess returns (risk_free_rate=0 makes the period-rf
+    # conversion a no-op regardless of periods_per_year) -> annualising SE by
+    # sqrt(m) must match the same scaling sharpe_ratio() itself uses.
+    returns = pd.Series([0.02, -0.01, 0.015, -0.005, 0.01, -0.02, 0.03])
+    se_unit = sharpe_ratio_standard_error(returns, risk_free_rate=0.0, periods_per_year=1)
+    se_annual = sharpe_ratio_standard_error(returns, risk_free_rate=0.0, periods_per_year=252)
+    assert se_annual == pytest.approx(se_unit * np.sqrt(252), rel=1e-9)
+
+
+def test_sharpe_se_shrinks_with_more_observations():
+    # More observations of the same underlying process -> lower estimation
+    # uncertainty on the Sharpe ratio itself, holding the process fixed.
+    np.random.seed(7)
+    short_series = pd.Series(np.random.normal(0.0005, 0.01, 30))
+    long_series = pd.concat([short_series] * 10, ignore_index=True)  # same SR, 10x the observations
+    se_short = sharpe_ratio_standard_error(short_series, risk_free_rate=0.0, periods_per_year=252)
+    se_long = sharpe_ratio_standard_error(long_series, risk_free_rate=0.0, periods_per_year=252)
+    assert se_long < se_short
+
+
+def test_sharpe_se_nan_for_fewer_than_two_observations():
+    assert np.isnan(sharpe_ratio_standard_error(pd.Series([0.01]), periods_per_year=252))
+
+
+def test_summarise_performance_includes_sharpe_se():
+    np.random.seed(21)
+    returns = pd.Series(np.random.normal(0.0005, 0.012, 100))
+    summary = summarise_performance(returns, periods_per_year=252)
+    assert "sharpe_se" in summary
+    assert summary["sharpe_se"] > 0
 
 
 def test_summarise_performance_always_includes_ulcer_skew_kurtosis():

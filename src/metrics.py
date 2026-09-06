@@ -72,6 +72,44 @@ def sharpe_ratio(
     return (excess_returns.mean() / vol) * np.sqrt(periods_per_year)
 
 
+def sharpe_ratio_standard_error(
+    returns: pd.Series,
+    risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
+    periods_per_year: int = TRADING_DAYS_PER_YEAR,
+) -> float:
+    """
+    Approximate standard error of the estimated Sharpe ratio (Lo, 2002, "The
+    Statistics of Sharpe Ratios" — asymptotic variance under IID returns):
+    `SE(SR_period) = sqrt((1 + 0.5*SR_period^2) / n)`, computed at the
+    PER-PERIOD Sharpe ratio and period count `n`, then scaled to the same
+    annualised units as `sharpe_ratio()` above by `sqrt(periods_per_year)` —
+    the same scaling the point estimate itself uses (`SR_annual =
+    SR_period * sqrt(periods_per_year)`), so the two numbers stay directly
+    comparable (e.g. `sharpe_ratio ± 1.96 * sharpe_ratio_standard_error` for
+    a rough 95% CI).
+
+    Exists specifically to put a real number behind the "a Sharpe of 5.89 on
+    a 30-period window isn't reliable" caveat stated throughout this app's UI
+    — a large SE relative to the point estimate is the statistical reason
+    that caveat holds, not just an appeal to intuition about small samples.
+    IID-normal-returns is a simplification (real returns show autocorrelation
+    and fat tails), same documented-trade-off spirit as the Hurst exponent
+    estimator in `timeseries_diagnostics.py` — a rough, honest order-of-
+    magnitude figure, not a precise confidence bound.
+    """
+    n = returns.shape[0]
+    if n < 2:
+        return float("nan")
+    period_rf = (1.0 + risk_free_rate) ** (1.0 / periods_per_year) - 1.0
+    excess_returns = returns - period_rf
+    vol = excess_returns.std(ddof=1)
+    if vol == 0 or np.isnan(vol):
+        return float("nan")
+    sr_period = excess_returns.mean() / vol
+    se_period = np.sqrt((1.0 + 0.5 * sr_period ** 2) / n)
+    return float(se_period * np.sqrt(periods_per_year))
+
+
 def sortino_ratio(
     returns: pd.Series,
     risk_free_rate: float = DEFAULT_RISK_FREE_RATE,
@@ -327,6 +365,7 @@ def summarise_performance(
         "annual_return": annualised_return(returns, periods_per_year),
         "annual_volatility": annualised_volatility(returns, periods_per_year),
         "sharpe_ratio": sharpe_ratio(returns, risk_free_rate, periods_per_year),
+        "sharpe_se": sharpe_ratio_standard_error(returns, risk_free_rate, periods_per_year),
         "sortino_ratio": sortino_ratio(returns, risk_free_rate, periods_per_year),
         "calmar_ratio": calmar_ratio(returns, periods_per_year),
         "omega_ratio": omega_ratio(returns),

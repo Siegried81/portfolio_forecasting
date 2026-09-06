@@ -41,12 +41,25 @@ def _count_tokens(text: str) -> int:
 def truncate_to_token_budget(text: str, max_tokens: int = MAX_CONTEXT_TOKENS) -> str:
     """Hard-truncate free-text context (news articles, etc.) to a token budget
     before it's stuffed into a prompt, so a chatty NewsAPI response never blows
-    past a small local model's context window."""
+    past a small local model's context window.
+
+    BUGFIX (2026-09-04): the truncation itself used to call
+    `tiktoken.get_encoding()` directly, unguarded — if that download is
+    blocked (offline dev box, a restricted container network policy), this
+    raised straight through as an uncaught HTTPError instead of degrading,
+    which broke this module's own documented "fails soft" contract. Same
+    char-count fallback as `_count_tokens` (~4 chars/token) is now used for
+    the actual truncation too, so a network hiccup here can never crash a
+    feature that's meant to be enrichment, not core to the app.
+    """
     if _count_tokens(text) <= max_tokens:
         return text
-    encoding = tiktoken.get_encoding("cl100k_base")
-    tokens = encoding.encode(text)[:max_tokens]
-    return encoding.decode(tokens) + "\n[...truncated...]"
+    try:
+        encoding = tiktoken.get_encoding("cl100k_base")
+        tokens = encoding.encode(text)[:max_tokens]
+        return encoding.decode(tokens) + "\n[...truncated...]"
+    except Exception:
+        return text[: max_tokens * 4] + "\n[...truncated...]"
 
 
 def _call_groq(messages: list[Message], temperature: float, max_tokens: int) -> str:

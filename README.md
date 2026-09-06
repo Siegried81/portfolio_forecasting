@@ -24,6 +24,7 @@ cross-referencing NewsAPI, Finnhub, and SEC EDGAR filings.
 
 ## Contents
 
+- [Screenshots](#screenshots)
 - [Understanding the KPIs — formulas & how to read them](#understanding-the-kpis--formulas--how-to-read-them)
 - [Repository structure](#repository-structure)
 - [Key design decisions vs. the original brief](#key-design-decisions-vs-the-original-brief)
@@ -37,271 +38,129 @@ cross-referencing NewsAPI, Finnhub, and SEC EDGAR filings.
 - [Known limitations](#known-limitations)
 - [Next steps](#next-steps)
 
+## Screenshots
+
+**Overview — Macro & Risk context**
+![Macro and risk context panel: FRED yields, term spread, VIX, Sahm Rule](images/overview_macrp_risks.png)
+
+**Overview — Prices & Analytics**
+![Rebased price history and time-series diagnostics table](images/prices_analysis.png)
+
+**Efficient Frontier**
+![Mean-variance efficient frontier with optimal weights, diversification ratio and HHI](images/efficient_frontier.png)
+
+**Forecast & Compare — the three-portfolio comparison**
+![Historical vs forecast-based vs realized-optimal portfolio comparison table and chart](images/forecast_compare.png)
+
+**Walk-forward validation**
+![Box plot of realized Sharpe ratio per portfolio type across expanding windows](images/walk_forward_validation.png)
+
+**AI Analyst — commentary & sentiment**
+![LLM-generated portfolio commentary](images/AI_portfolio_analyst.png)
+![News sentiment by ticker with source attribution](images/sentiment_sources.png)
+
+**Chatbot — grounded Q&A**
+![Chatbot answering a question about portfolio allocation, grounded in computed numbers](images/chatbot_1.png)
+![Chatbot follow-up question with context retained](images/chatbot_2.png)
+
 ## Understanding the KPIs — formulas & how to read them
 
-Every metric below is computed in `src/metrics.py` (pure functions, unit-tested in
-`tests/test_metrics.py`) unless noted otherwise. `r` = period return series (daily/weekly/monthly
-depending on the sidebar), `rf` = risk-free rate, `n` = periods per year (252/52/12).
+Computed in `src/metrics.py` (unit-tested in `tests/test_metrics.py`) unless noted otherwise.
+`r` = period return series (daily/weekly/monthly per the sidebar), `rf` = risk-free rate,
+`n` = periods per year (252/52/12).
 
 ### 1. Return & risk — the building blocks
 
-**Annualised Return**
-- What it measures: the compounded (geometric) growth rate, scaled to a 1-year horizon.
-- Formula: `(∏(1 + r)) ^ (n / periods) − 1`
-- How to read it: the "headline" return. Geometric, not arithmetic mean × n — arithmetic mean
-  overstates the true return of a volatile series (a +50%/−50% sequence has 0% geometric return,
-  not the naive +0% either — check the actual math if this surprises you, it's a classic trap).
-- Where: every metrics table (Overview, Efficient Frontier, Forecast & Compare).
-
-**Annualised Volatility**
-- What it measures: the standard deviation of returns, annualised.
-- Formula: `std(r) × √n`
-- How to read it: total risk — both upside and downside swings count equally. Higher isn't
-  automatically "bad" (see Sortino/Omega below for asymmetric views), but it's the risk figure
-  every other ratio on this page normalises against in some form.
-- Where: same tables as Annualised Return.
-
-**Max Drawdown**
-- What it measures: the single largest peak-to-trough decline in cumulative wealth, over the
-  whole period shown.
-- Formula: build the wealth index `W(t) = ∏(1+r)` up to `t`, then `min[ W(t) / max(W(0..t)) − 1 ]`
-- How to read it: "if you'd invested at the worst possible moment and sold at the worst possible
-  moment after, this is what you'd have lost." A negative percentage, e.g. −35%. This is the
-  number that correlates most with an investor actually panic-selling — bigger drawdowns are
-  harder to sit through than volatility alone suggests.
-- Where: every metrics table; also the input to Calmar (below).
-
-**Ulcer Index** (added 2026-09)
-- What it measures: like Max Drawdown, but captures *duration* underwater too, not just depth.
-- Formula: root-mean-square of the percentage drawdown at *every* point in the series (Peter
-  Martin, 1987), not just the single worst point.
-- How to read it: a portfolio stuck at -20% for a year and one that dips to -20% for a single week
-  and recovers share the identical Max Drawdown — but very different Ulcer Index values. Lower is
-  better; 0 means the wealth curve never dipped below a prior peak. No universal "good" threshold;
-  compare across the three portfolios the same way Calmar is compared.
-- Where: every metrics table.
-
-**VaR 95% (Value at Risk)**
-- What it measures: the loss threshold that historical returns crossed in the worst 5% of periods.
-- Formula: the 5th percentile of the historical return distribution (non-parametric — no normal-
-  distribution assumption, since equity returns are fat-tailed).
-- How to read it: "on the worst 1-in-20 periods historically, the loss exceeded X%." It says
-  nothing about how much worse than X% those periods got — that's what CVaR is for.
-- Where: every metrics table.
-
-**CVaR 95% (Conditional VaR / Expected Shortfall)**
-- What it measures: the *average* loss across only the periods that were worse than VaR.
-- Formula: `mean(r | r ≤ VaR_95)`
-- How to read it: the more informative tail-risk number — always at least as bad as VaR (it's an
-  average of the tail beyond the VaR threshold). A large gap between VaR and CVaR flags a fat,
-  dangerous tail that VaR alone would understate.
-- Where: every metrics table.
+| Metric | Formula | How to read it |
+|---|---|---|
+| Annualised Return | `(∏(1+r))^(n/periods) − 1` | Geometric, not arithmetic mean × n — a ±50% sequence is 0%, not the naive average (classic trap). |
+| Annualised Volatility | `std(r) × √n` | Total risk (upside + downside count equally). Not inherently "bad" — see Sortino/Omega for asymmetric views. |
+| Max Drawdown | `min[W(t)/max(W(0..t)) − 1]`, `W(t)=∏(1+r)` | Worst peak-to-trough loss — correlates most with an investor actually panic-selling. |
+| Ulcer Index (2026-09) | RMS of the % drawdown at *every* point (Peter Martin, 1987) | Captures *duration* underwater, not just depth. Lower is better; 0 = never dipped below a prior peak. |
+| VaR 95% | 5th percentile of the return distribution (non-parametric) | "Worst 1-in-20 period loss exceeded X%" — says nothing about how much worse those periods got. |
+| CVaR 95% | `mean(r \| r ≤ VaR_95)` | Average loss beyond VaR — always at least as bad; a large VaR/CVaR gap flags a fat, dangerous tail. |
 
 ### 2. Risk-adjusted return ratios — reward per unit of risk
 
-**Sharpe Ratio**
-- What it measures: excess return (over the risk-free rate) per unit of *total* volatility.
-- Formula: `(mean(r − rf_period) / std(r − rf_period)) × √n`, where `rf_period` is the annual `rf`
-  converted to a per-period rate — never subtract the annual rate directly from period returns,
-  it massively understates excess return.
-- How to read it: the standard "risk-adjusted return" headline number. Higher is better; above 1
-  is generally considered good, above 2 very good, in the context of realistic equity strategies.
-  Penalises upside volatility exactly as much as downside — its main limitation, which Sortino
-  fixes.
-- Where: every metrics table; the walk-forward box plot's y-axis.
-
-**Sortino Ratio**
-- What it measures: like Sharpe, but the denominator only counts *downside* deviation (returns
-  below the risk-free target).
-- Formula: `(mean(r − rf_period) / downside_deviation) × √n`, where
-  `downside_deviation = √(mean((r − rf_period)² | r − rf_period < 0))`
-- How to read it: two strategies can share a Sharpe ratio while one has "many small gains, rare
-  big losses" and the other "steady symmetric swings" — Sortino tells them apart, since only the
-  first strategy's big losses hurt this ratio. Sortino ≥ Sharpe is normal for most real return
-  series (upside vol usually exceeds downside vol for equities over time).
-- Where: every metrics table.
-
-**Calmar Ratio**
-- What it measures: annualised return per unit of the *single worst* drawdown lived through.
-- Formula: `annualised_return / |max_drawdown|`
-- How to read it: where Sharpe/Sortino penalise the whole distribution's spread, Calmar penalises
-  only the worst outcome an investor actually experienced — the number a risk committee asks for
-  when "volatility looks fine on average, but that one drawdown was brutal." No universal
-  good/bad threshold; compare across the three portfolios in the same tab, not against a memorised
-  number.
-- Where: Overview (per-asset), Forecast & Compare (per-portfolio).
-
-**Omega Ratio**
-- What it measures: the ratio of total gains to total losses above/below a threshold (0% by
-  default), using the *entire* empirical return distribution — not just its mean and variance.
-- Formula: `sum(r − threshold | r > threshold) / |sum(r − threshold | r < threshold)|`
-- How to read it: > 1 means gains outweighed losses in total magnitude; < 1 means the reverse.
-  Because it uses the full distribution shape, Omega will diverge from Sharpe/Sortino exactly when
-  returns are skewed or fat-tailed — precisely the case where a mean-variance summary is most
-  likely to mislead. Treat it as a second opinion alongside Sharpe/Sortino, not a replacement.
-  A value of `∞` (shown as `—` in the app) means there were literally no losing periods in the
-  sample — check the sample size before trusting that.
-- Where: every metrics table.
-
-**Skewness & Kurtosis** (added 2026-09)
-- What they measure: the return distribution's third and fourth standardised moments — the "skewed
-  or fat-tailed" language in Omega's own description above, made explicit and numeric instead of
-  implicit.
-- How to read Skewness: 0 = symmetric; negative = a longer/fatter *left* tail (occasional large
-  losses — the shape most equity return series actually have, and exactly the asymmetry
-  Sortino/Omega are built to catch that Sharpe's symmetric variance can't); positive = a
-  longer/fatter *right* tail.
-- How to read Kurtosis: pandas' excess-kurtosis convention — 0 = same tail thickness as a normal
-  distribution. Positive = fatter tails than normal (more extreme outcomes than a Gaussian model
-  would predict, the standard finding for equity returns and the reason VaR/CVaR above are
-  computed non-parametrically rather than assumed normal in the first place).
-- Where: every metrics table.
+| Metric | Formula | How to read it |
+|---|---|---|
+| Sharpe | `(mean(r−rf_period)/std(r−rf_period)) × √n` | Above 1 generally good, above 2 very good. Penalises upside volatility exactly as much as downside. |
+| Sharpe SE (2026-09) | `√((1+0.5×SR_period²)/n)`, annualised (Lo, 2002) | Standard error of the Sharpe estimate itself — a rough 95% range is `Sharpe ± 1.96×SE`. Puts a real number behind "a Sharpe of 5.89 on 30 periods isn't reliable" instead of just an appeal to intuition. |
+| Sortino | Same, denominator = downside deviation only (`√(mean((r−rf_period)² \| r−rf_period<0))`) | Sortino ≥ Sharpe is normal for equities — only downside swings count against it. |
+| Calmar | `annual_return / \|max_drawdown\|` | Penalises only the single *worst* outcome lived through, not the whole spread — the number a risk committee asks for. |
+| Omega | `Σ(r−threshold \| r>threshold) / \|Σ(r−threshold \| r<threshold)\|` | Uses the *entire* empirical distribution, so it diverges from Sharpe/Sortino exactly when returns are skewed/fat-tailed. `∞` (shown `—`) = zero losing periods in the sample. |
+| Skewness / Kurtosis (2026-09) | 3rd / 4th standardised moments of `r` | Skew: 0 symmetric, negative = fatter *left* tail (large losses — the typical equity shape). Kurtosis (pandas excess convention): 0 = normal tails, positive = fatter than normal. |
 
 ### 3. Benchmark-relative metrics — vs. SPY
 
-Computed only when a benchmark return series is available (SPY is always fetched in the
-background regardless of your ticker selection specifically so these are always computable).
+Computed whenever a benchmark series is available (SPY is always fetched in the background
+regardless of your ticker selection, specifically so these are always computable).
 
-**Beta**
-- What it measures: sensitivity to the benchmark's moves — CAPM beta.
-- Formula: `Cov(r, r_benchmark) / Var(r_benchmark)`
-- How to read it: beta of 1.0 moves with the market; > 1.0 amplifies market moves (more
-  aggressive); < 1.0 dampens them (more defensive); negative beta moves opposite the market (rare,
-  usually a hedge-like asset e.g. some gold/vol exposure in stress periods).
-- Where: Overview (per-asset), Forecast & Compare (per-portfolio).
+| Metric | Formula | How to read it |
+|---|---|---|
+| Beta | `Cov(r, r_benchmark) / Var(r_benchmark)` | 1.0 moves with the market; >1.0 amplifies; <1.0 dampens; negative = hedge-like (rare). |
+| Information Ratio | `annualised(mean(r−r_benchmark)) / (std(r−r_benchmark)×√n)` | *Consistency* of outperformance vs. SPY, not just its size — what active-mandate reviews lead with, not Sharpe. |
+| Treynor | `(annual_return − rf) / beta` | Return per unit of *systematic* (market) risk, vs. Sharpe's total-risk denominator. |
+| Jensen's Alpha | `annual_return − [rf + beta×(annual_benchmark_return − rf)]` | Return above what CAPM predicts given the portfolio's own beta — what a CAPM-literate interviewer asks for the moment Beta is on screen. |
 
-**Information Ratio**
-- What it measures: how *consistent* the portfolio's outperformance over SPY has been, not just
-  its size.
-- Formula: `annualised(mean(r − r_benchmark)) / (std(r − r_benchmark) × √n)` — active return over
-  tracking error.
-- How to read it: this is the metric active-mandate performance reviews lead with, not Sharpe —
-  Sharpe judges a portfolio in isolation, IR judges it against the mandate it's meant to beat. A
-  small, very *consistent* edge over SPY gives a high IR even with modest absolute returns; a big
-  edge that's erratic gives a lower IR than you'd expect from the headline number alone.
-- Where: Forecast & Compare (per-portfolio).
+### 4. Optimizer outputs — expected, not realized (Efficient Frontier tab)
 
-**Treynor Ratio**
-- What it measures: excess return per unit of *systematic* (market/beta) risk, instead of Sharpe's
-  *total*-risk denominator.
-- Formula: `(annualised_return − rf) / beta`
-- How to read it: two portfolios can share a Sharpe ratio while one carries far more market
-  exposure (higher beta) than the other — Treynor surfaces that difference. Use it alongside
-  Sharpe when you specifically want to know how much of the return came from being exposed to the
-  market at all, versus genuine diversification or security selection.
-- Where: Forecast & Compare (per-portfolio).
+These come from the optimizer's own inputs (historical mean/covariance, Ledoit-Wolf shrinkage) —
+the optimizer's *target*, not a guarantee. Compare against the *realized* metrics in Forecast &
+Compare to see the gap between expectation and outcome.
 
-**Jensen's Alpha (CAPM alpha)**
-- What it measures: annualised return earned *above* what CAPM predicts given the portfolio's own
-  market exposure (beta) — added specifically because Beta and Treynor tell you how much market
-  risk was taken, but neither answers whether that risk-taking actually paid off beyond what beta
-  alone would predict.
-- Formula: `annualised_return − [rf + beta × (annualised_benchmark_return − rf)]`
-- How to read it: positive alpha = outperformed its own CAPM benchmark (genuine edge, or luck on a
-  single window — same caveat as everywhere else in this app); negative = underperformed what its
-  market exposure alone would predict, even if raw Sharpe/Sortino look fine in isolation. This is
-  the metric a CAPM-literate interviewer will ask for the moment Beta is on screen.
-- Where: Overview (per-asset), Forecast & Compare (per-portfolio).
-
-### 4. Optimizer outputs — expected, not realized
-
-Shown in the **Efficient Frontier** tab. These come from the optimizer's own inputs (historical
-mean/covariance, Ledoit-Wolf shrinkage) — they are the optimizer's *target*, not a guarantee of
-what will actually happen. Compare them against the *realized* metrics in Forecast & Compare to
-see the gap between expectation and outcome.
-
-- **Expected annual return** = `w · μ` (weights dotted with the expected-return vector)
-- **Expected annual volatility** = `√(w · Σ · w)` (portfolio variance from the covariance matrix)
-- **Expected Sharpe** = `(expected_return − rf) / expected_volatility`
-- **Diversification ratio** (added 2026-09) = `(weighted-average individual asset volatility) /
-  (actual portfolio volatility)`. The correlation matrix in the Overview tab is visual — this is
-  the number version. >1 whenever correlations are below 1 everywhere (the normal case); the gap
-  between the two is precisely the risk reduction diversification bought. =1 for a single asset
-  or perfectly correlated assets, where diversification buys nothing.
-- **Concentration (HHI)** (added 2026-09) = `Σ w_i²`. Ranges from `1/N` (equal-weighted across N
-  assets) to 1.0 (a single asset). A quick check that the sidebar's max-weight cap is actually
-  doing its job — distinct from the diversification ratio above, which measures the risk benefit
-  realised, not the allocation shape itself.
+- **Expected return** `w·μ`, **expected volatility** `√(w·Σ·w)`, **expected Sharpe** `(expected_return−rf)/expected_volatility`.
+- **Diversification ratio** (2026-09) = weighted-average individual asset volatility ÷ actual
+  portfolio volatility. >1 whenever correlations are below 1 (the normal case) — the numeric
+  version of the Overview tab's correlation matrix. =1 means diversification buys nothing.
+- **Concentration / HHI** (2026-09) = `Σ w_i²`. Ranges `1/N` (equal-weighted) to `1.0` (single
+  asset) — a quick check that the sidebar's max-weight cap is actually doing its job.
 
 ### 5. Forecast validation
 
-**Forecast win rate** (walk-forward section, Forecast & Compare tab)
-- What it measures: across every walk-forward window, the fraction where the forecast-based
-  portfolio's *realized* Sharpe beat the historical-based portfolio's.
-- How to read it: a rate hovering near 50% across many windows is the *expected, honest* result
-  for short-horizon equity price forecasting (consistent with the efficient market hypothesis) —
-  it means the forecast isn't reliably adding value beyond noise. A rate consistently well above
-  50% across many independent windows would be the actual signal of a genuine edge. Don't read
-  much into the result from a single window (see "Walk-forward validation" further below for why).
+**Forecast win rate** (walk-forward section, Forecast & Compare tab) — across every expanding
+window, the fraction where the forecast-based portfolio's *realized* Sharpe beat the
+historical-based one's. Near 50% across many windows is the honest, expected result for
+short-horizon price forecasting (consistent with the efficient market hypothesis) — a rate
+consistently well above 50% would be the real signal of a genuine edge. Don't read much into a
+single window (see "Walk-forward validation" below for why).
 
-### 6. Macro context (not portfolio-specific, but shapes interpretation)
+### 6. Macro context (FRED — shapes interpretation, not portfolio-specific)
 
-- **VIX** — CBOE Volatility Index, the market's "fear gauge" (implied 30-day S&P 500 volatility).
-  App's read: < 15 = calm, 15–25 = normal, > 25 = elevated stress. Useful context for reading
-  every other metric above: the same Sharpe ratio means something different achieved during a
-  VIX-12 calm stretch vs. a VIX-30 stress period.
-- **10Y–3M Treasury term spread** — a negative spread (short rates above long rates) has preceded
-  every US recession since the 1960s, with some false positives. Shown as context, not a trading
-  signal.
-- **Risk-free rate** — live 3-month T-bill yield (FRED), used as `rf` in every ratio above that
-  needs one (Sharpe, Sortino, Treynor). Overridable by hand in the sidebar.
-- **CPI inflation (YoY)**, **unemployment rate**, and **effective Fed funds rate** (all added
-  2026-09, FRED) — the rest of the Fed's dual mandate plus the actual policy rate, not just a
-  market-priced proxy for it. Missing these was a real gap: the yield curve and VIX alone don't
-  tell you what the Fed is actually targeting or where the policy rate currently sits.
-- **Sahm Rule recession indicator** (added 2026-09, FRED's `SAHMREALTIME`) — the 3-month average
-  unemployment rate rising 0.50 points above its low of the prior 12 months. Every reading ≥0.50
-  has coincided with the start of a US recession since 1970, with no false positives to date —
-  about as close to a single-number recession signal as macro data gets.
-- **Baa corporate credit spread vs 10Y Treasury** (added 2026-09, FRED's `BAA10Y`) — corporate
-  credit risk / risk appetite, a different stress channel from the government-yield curve or VIX
-  (widening means the market is pricing more corporate default/liquidity risk specifically).
-- **Real GDP growth** (added 2026-09, FRED's `A191RL1Q225SBEA`, quarterly, seasonally adjusted
-  annual rate) — the headline "GDP grew at X% annualized" figure. Updates far less often than
-  everything else on the panel (quarterly, not daily/monthly).
-- **Industrial Production (YoY), as an ISM Manufacturing PMI proxy** (added 2026-09, FRED's
-  `INDPRO`) — a substitution documented honestly, same spirit as the Kats/Riskfolio-Lib swaps in
-  "Key design decisions" below: ISM's own PMI is a paid, proprietary survey series, not available
-  on FRED or any free API. Industrial Production is the closest legitimate free alternative — real
-  output data rather than a survey diffusion index, but it captures the same underlying signal
-  (manufacturing-sector momentum).
-- Every FRED series above is linked from a "Sources" expander directly under the macro panel in
-  the app, same transparency pattern as the news digest's source links.
+| Series | What it signals |
+|---|---|
+| VIX | "Fear gauge": <15 calm, 15–25 normal, >25 elevated stress. |
+| 10Y–3M Treasury term spread | Negative has preceded every US recession since the 1960s (some false positives) — context, not a trading signal. |
+| Risk-free rate (3M T-bill) | `rf` in every ratio above that needs one — overridable by hand in the sidebar. |
+| CPI YoY, unemployment rate, Fed funds rate (2026-09) | The rest of the Fed's dual mandate plus the actual policy rate — the yield curve and VIX alone don't cover this. |
+| Sahm Rule recession indicator (2026-09, `SAHMREALTIME`) | ≥0.50 (3-month avg. unemployment 0.50pt above its 12-month low) has coincided with every US recession's start since 1970, no false positives to date. |
+| Baa corporate credit spread vs 10Y (2026-09, `BAA10Y`) | Corporate credit-risk appetite — a different stress channel from the yield curve or VIX. |
+| Real GDP growth (2026-09, quarterly, `A191RL1Q225SBEA`) | Headline "GDP grew at X% annualized" — updates far less often than the rest of the panel. |
+| Industrial Production YoY (2026-09, `INDPRO`) | Proxy for ISM Manufacturing PMI (paid/proprietary, no free API) — real output data capturing the same manufacturing-momentum signal. |
 
-### 7. Time-series diagnostics (structure, not performance)
+Every series above links to its FRED source page from a "Sources" expander under the macro panel.
 
-Shown in the **Overview** tab, per asset — these diagnose the series' own structure rather than
-summarising performance, the kind of check done *before* trusting a forecast rather than after.
+### 7. Time-series diagnostics (Overview tab, per asset — series structure, not performance)
 
-**ADF stationarity test** (Augmented Dickey-Fuller, on returns)
-- What it measures: whether the return series has a unit root (is non-stationary).
-- How to read it: directly validates `forecasting.py`'s own ARIMA `d=1` first-differencing choice
-  — ARIMA fixes `d=1` because price *levels* are non-stationary by construction; this test checks
-  whether the differenced series (returns) actually *is* stationary, instead of the codebase just
-  asserting it. "Yes" (p < 0.05) is the expected, textbook result for returns.
+The kind of check done *before* trusting a forecast, not after.
 
-**Hurst exponent** (on prices)
-- What it measures: persistence/self-similarity of the price series, via the variance-of-lagged-
-  differences method (a standard simplified estimator — not full rescaled-range analysis, a
-  documented trade-off, same spirit as TF-IDF vs. embeddings in `rag.py`).
-- How to read it: > 0.55 trending/momentum (a move tends to be followed by a move in the same
-  direction); < 0.45 mean-reverting (a move tends to reverse); ≈ 0.5 a random walk — the concrete,
-  per-asset number behind the efficient-market-hypothesis caveat stated throughout this app's
-  forecasting UI. Most liquid large-cap equities sit close to 0.5.
-
-**Rolling Sharpe ratio** (chart, window auto-sized to the sample length)
-- What it measures: risk-adjusted return computed on a moving window instead of the whole sample.
-- How to read it: a single end-of-sample Sharpe can hide a regime change (calm-then-crisis, or the
-  reverse) — the rolling version shows how it actually evolved, the direct answer to "what's the
-  trend" rather than one snapshot number.
+- **ADF stationarity test** (on returns) — validates `forecasting.py`'s own ARIMA `d=1`
+  first-differencing choice. "Yes" (p<0.05) is the expected, textbook result for returns (unlike
+  price *levels*, non-stationary by construction).
+- **Hurst exponent** (on prices, variance-of-lagged-differences estimator — a documented
+  simplification, not full rescaled-range analysis) — >0.55 trending/momentum, <0.45
+  mean-reverting, ≈0.5 random walk. Most liquid large-caps sit close to 0.5.
+- **Rolling Sharpe ratio** (window auto-sized to sample length) — a single end-of-sample Sharpe can
+  hide a regime change (calm-then-crisis or the reverse); the rolling version shows how it actually
+  evolved.
 
 ### 8. Fundamentals (data points, not ratios)
 
-Per-ticker (Overview tab, fetched on demand): market capitalization, trailing/forward P/E, beta
-(the provider's own calculation — may differ slightly from the app's own `beta_vs_benchmark` above
-due to differing lookback windows/methodology), dividend yield, 52-week price range. Tried Finnhub
-first, Twelve Data as fallback (see the source-chain note further below) — the table's **Source**
-column shows which one actually answered for each ticker, rather than leaving that implicit.
+Per-ticker (Overview tab, fetched on demand): market cap, trailing/forward P/E, beta (the
+provider's own calculation — may differ slightly from this app's `beta_vs_benchmark` above due to
+lookback/methodology differences), dividend yield, 52-week range. Finnhub tried first, Twelve Data
+as fallback (see the source-chain note further below) — the table's **Source** column shows which
+one actually answered for each ticker.
 
 
 
@@ -335,7 +194,10 @@ portfolio-forecasting/
 │   ├── test_macro_data.py      # FRED divide_by pitfall (Sahm Rule), YoY calculation, GDP/PMI-proxy fetch
 │   ├── test_news_sentiment.py  # Finnhub -> VADER sentiment cascade, explicit "not available" case
 │   ├── test_timeseries_diagnostics.py  # ADF stationary vs. random walk, Hurst trending vs. mean-reverting
-│   └── test_factor_models.py   # PCA cov: symmetric/PSD, known factor-structure recovery, clamping
+│   ├── test_factor_models.py   # PCA cov: symmetric/PSD, known factor-structure recovery, clamping
+│   ├── test_rag.py             # TF-IDF retrieval: ranking, zero-similarity filtering, never-raises contract
+│   ├── test_llm_client.py      # Groq->Ollama fallback cascade, token-budget truncation without network
+│   └── test_ai_features.py     # build_results_context formatting (shared by commentary + chatbot)
 ├── .github/workflows/ci.yml  # pytest (blocking) + mypy (non-blocking) on every push/PR
 ├── requirements.txt
 ├── Dockerfile                 # containerised run — also the base for Render's `env: docker`
@@ -363,7 +225,7 @@ than silently swapped:
 | Brief suggests | Used instead | Why |
 |---|---|---|
 | **Kats** for forecasting | **statsmodels** (ARIMA, Holt-Winters ETS) + a naive random-walk baseline | Kats' last PyPI release was **0.2.0 on 15 March 2022** — [pypi.org/project/kats/#history](https://pypi.org/project/kats/#history) — nothing published since, so it predates ~3.5 years of pandas/numpy releases. statsmodels is the actively-maintained, industry-standard alternative. |
-| **Riskfolio-Lib** for optimization | **PyPortfolioOpt** | Riskfolio-Lib is built on `cvxpy` with a much broader feature set (12 convex risk measures, Black-Litterman, risk factors, tracking-error/turnover constraints — [pypi.org/project/Riskfolio-Lib](https://pypi.org/project/Riskfolio-Lib/)), which is real capability but heavier than this project needs. PyPortfolioOpt ([pypi.org/project/pyportfolioopt](https://pypi.org/project/pyportfolioopt/)) covers exactly max-Sharpe/min-vol/efficient-frontier with a lighter dependency footprint. |
+| **Riskfolio-Lib** for optimization | **PyPortfolioOpt** | Two alternatives were evaluated against PyPortfolioOpt, both rejected for the same reason: real capability this project's scope doesn't need, at a heavier dependency cost. **Riskfolio-Lib** ([pypi.org/project/Riskfolio-Lib](https://pypi.org/project/Riskfolio-Lib/)) is built on `cvxpy` with 12 convex risk measures, Black-Litterman, risk factors, tracking-error/turnover constraints. **skfolio** ([skfolio.org](https://skfolio.org/)) is newer (2026) and scikit-learn-native (`fit`/`predict`, `GridSearchCV`-compatible) — Mean-Risk, Risk Budgeting, Hierarchical Risk Parity, Black-Litterman, Ledoit-Wolf/Gerber/denoising covariance estimators, walk-forward cross-validation built in — genuinely closer to this project's own PCA-factor-model and walk-forward additions than Riskfolio-Lib is, but still pulls in `cvxpy` + `joblib` + its own `plotly` pin, and its `fit`/`predict` API is a full rewrite of `optimization.py`, not a drop-in swap. PyPortfolioOpt ([pypi.org/project/pyportfolioopt](https://pypi.org/project/pyportfolioopt/)) covers exactly max-Sharpe/min-vol/efficient-frontier with the lightest footprint of the three. **If the brief literally requires a feature none of PyPortfolioOpt's surface has** (e.g. Black-Litterman by name, or a specific convex risk measure like CVaR-native optimization) **skfolio is the one to migrate to**, not Riskfolio-Lib — same reasoning as the PCA-factor-model addition already in this codebase: skfolio's built-in walk-forward cross-validation and Ledoit-Wolf/Gerber covariance estimators overlap directly with `backtesting.py`/`factor_models.py`'s own hand-rolled versions, so a migration would consolidate rather than duplicate. Absent that literal requirement, staying on PyPortfolioOpt keeps the dependency surface and `optimization.py`'s API exactly as documented above — no functional gain from switching without a concrete need driving it. |
 | **GitHub Pages** for deployment | **Streamlit Community Cloud** (primary) + **Render** (backup, via `render.yaml` + `Dockerfile`) | GitHub Pages serves static files only — "GitHub Pages does not support server-side languages such as PHP, Ruby, or Python" ([official GitHub Docs](https://docs.github.com/articles/creating-project-pages-manually)) — it cannot run a Streamlit server process. |
 | **ISM Manufacturing PMI** for macro context | **Industrial Production Index (FRED `INDPRO`)** | ISM's PMI is a paid, proprietary survey-based series — not available on FRED or any free API. Industrial Production is the closest legitimate free alternative: real output data rather than a survey diffusion index, but it captures the same underlying signal (manufacturing-sector momentum). |
 | **Airflow** for orchestration | **None — on-demand fetch inside Streamlit's own request-response cycle** | This app is interactive and synchronous (change a sidebar parameter, it recomputes), not a scheduled batch pipeline — there's no recurring DAG to orchestrate. Airflow would mean deploying a scheduler + webserver + metadata DB for zero present need, the same over-engineering trap Riskfolio-Lib was avoided for above. It would become the right tool if this moved from live per-request fetches to nightly pre-materialised data — noted as a real future option, not dismissed outright. |
@@ -741,9 +603,27 @@ Things I'm aware of and chose not to fix within this project's scope, rather tha
 - **CI's `mypy` step is non-blocking for now** (`continue-on-error: true` in `ci.yml`) — the
   codebase wasn't written under mypy from day one, so a first strict run surfaces a backlog I
   haven't triaged yet. `pytest` is the blocking gate today.
-- **`.dockerignore`/local `.venv` aren't tracked in git** by design, but the Dockerfile currently
-  pins `python:3.12-slim` while `requirements.txt`'s comments were written against Python 3.14
-  compatibility testing — I haven't fully reconciled the two yet (flagged, not yet resolved).
+- **`.dockerignore`/local `.venv` aren't tracked in git** by design.
+- ~~Dockerfile pins `python:3.12-slim` while `requirements.txt` was written against Python 3.14
+  compatibility testing — never reconciled.~~ **Resolved (2026-09-04):** the full test suite
+  (105 tests, including the 3 new files above) was run against Python 3.12.3 with the exact
+  pinned `requirements.txt` — 105/105 pass. The version-floor pins (`pandas>=3.0.5`,
+  `statsmodels>=0.14.4,<0.15.0`, etc.) were written to cover 3.12 through 3.14 in the same range,
+  not 3.14-only as this bullet used to imply; `python:3.12-slim` in the Dockerfile was always a
+  safe choice, it just hadn't been verified end-to-end until now. 3.12 stays the recommended
+  local interpreter (see the troubleshooting section above) since it has the widest, most mature
+  wheel availability of the two as of 2026.
+- **Two bugs found and fixed during this pass (2026-09-04):** (1) the sidebar's "Risk-free rate"
+  and "Max weight per asset" sliders stored fractions (e.g. `0.35`) but formatted them with a
+  literal `%` suffix (`format="%.0f%%"`) — `st.slider`'s `format` only controls display, it never
+  multiplies by 100, so "35%" was rendering as "0%". Fixed by running both sliders in
+  percentage-point units and converting to a fraction right after, so every downstream function's
+  input is unchanged. (2) `llm_client.truncate_to_token_budget`'s truncation branch called
+  `tiktoken.get_encoding()` unguarded — if that download is blocked (a restricted container
+  network, confirmed directly in this project's own test sandbox), it raised an uncaught
+  `HTTPError` instead of degrading, breaking this module's own "fails soft" contract. Both now
+  have regression tests (`test_llm_client.py`, and the slider fix is a UI-only change covered by
+  manual verification — see the Deployment section for how to re-check it after a `streamlit run`).
 
 ## Next steps
 
